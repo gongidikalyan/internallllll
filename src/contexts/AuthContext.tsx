@@ -72,11 +72,16 @@ async function ensureExecutiveBootstrapCredentials(state: PreviewDatabaseState):
 
   const now = new Date().toISOString();
   const roleMap = new Map(state.roles.map((r) => [r.id, r]));
-  const existingUserIds = new Set(state.user_credentials.map((c) => c.user_id));
   let mutated = false;
-
   for (const prof of state.profiles) {
-    if (existingUserIds.has(prof.id)) continue;
+    const existingCred = state.user_credentials.find((c) => c.user_id === prof.id);
+    if (existingCred) {
+      if (existingCred.email.toLowerCase() !== prof.email.toLowerCase()) {
+        existingCred.email = prof.email.toLowerCase();
+        mutated = true;
+      }
+      continue;
+    }
     const presetPassword = INITIAL_EXECUTIVE_PASSWORDS[prof.id];
     const ur = state.user_roles.find((u) => u.user_id === prof.id);
     const role = ur ? roleMap.get(ur.role_id) : undefined;
@@ -291,8 +296,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       if (error) throw new Error(error.message);
       if (data.user) {
-        const resolved = await resolveSupabaseAuthData(data.user.id);
-        setSessionData(resolved);
+        try {
+          const resolved = await resolveSupabaseAuthData(data.user.id);
+          setSessionData(resolved);
+        } catch (profileErr) {
+          await supabase.auth.signOut();
+          throw profileErr;
+        }
       }
       return;
     }

@@ -6,6 +6,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { erpRepository } from '../../services/erpRepository';
 import type { AvailabilityStatus } from '../../types/erp';
 import { StatusText } from '../../components/ui/StatusText';
+import { getLocalTodayIso } from '../../lib/date';
 
 const AVAILABILITY_OPTIONS: Array<{ value: AvailabilityStatus; label: string }> = [
   { value: 'available', label: 'Available' },
@@ -149,7 +150,7 @@ export function WorkspacePage() {
   }, [meetingsQuery.data, meetingParticipantsQuery.data, profile]);
 
   const myLeaveRequests = useMemo(() => (myLeaveQuery.data ?? []).slice(0, 5), [myLeaveQuery.data]);
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = getLocalTodayIso();
   const myTodayAttendance = useMemo(
     () => (myAttendanceQuery.data ?? []).find((a) => a.work_date === todayIso) ?? null,
     [myAttendanceQuery.data, todayIso]

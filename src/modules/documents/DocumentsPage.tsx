@@ -12,12 +12,14 @@ import {
   HardDrive,
   Search,
   Shield,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { erpRepository } from '../../services/erpRepository';
 import type { DocumentAccessScope, DocumentCategory, DocumentRecord } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -77,6 +79,7 @@ export function DocumentsPage() {
 
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
   const [editingDoc, setEditingDoc] = useState<DocumentRecord | null>(null);
+  const [deletingDoc, setDeletingDoc] = useState<DocumentRecord | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
@@ -221,6 +224,25 @@ export function DocumentsPage() {
       await queryClient.invalidateQueries({ queryKey: ['documents'] });
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update document.'),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (doc: DocumentRecord) => {
+      if (!currentUser || !companyId) throw new Error('Session unavailable.');
+      await erpRepository.deleteDocument(currentUser.id, companyId, doc);
+      return doc;
+    },
+    onSuccess: async (doc) => {
+      setActionError(null);
+      setDeletingDoc(null);
+      if (highlightedId === doc.id) setHighlightedId(null);
+      setActionFeedback(`Deleted "${doc.title}" from document repository.`);
+      await queryClient.invalidateQueries({ queryKey: ['documents'] });
+    },
+    onError: (err) => {
+      setDeletingDoc(null);
+      setActionError(err instanceof Error ? err.message : 'Unable to delete document.');
+    },
   });
 
   const handleDownload = async (doc: DocumentRecord) => {
@@ -472,14 +494,24 @@ export function DocumentsPage() {
                             Download
                           </button>
                           {canManage ? (
-                            <button
-                              type="button"
-                              onClick={() => openEditModal(doc)}
-                              className="inline-flex h-7 items-center gap-1 rounded border border-slate-200 px-2.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
-                            >
-                              <Edit3 className="h-3 w-3" />
-                              Version / Edit
-                            </button>
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => openEditModal(doc)}
+                                className="inline-flex h-7 items-center gap-1 rounded border border-slate-200 px-2.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
+                              >
+                                <Edit3 className="h-3 w-3" />
+                                Version / Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeletingDoc(doc)}
+                                className="inline-flex h-7 items-center gap-1 rounded border border-red-200 px-2.5 text-[11px] font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                                Delete
+                              </button>
+                            </>
                           ) : null}
                         </div>
                       </td>
@@ -792,6 +824,21 @@ export function DocumentsPage() {
           </div>
         </div>
       ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deletingDoc)}
+        title="Delete Document"
+        description={
+          deletingDoc
+            ? `Permanently delete "${deletingDoc.title}" (v${deletingDoc.version_label}) and remove its stored file?`
+            : ''
+        }
+        isPending={deleteMutation.isPending}
+        onCancel={() => setDeletingDoc(null)}
+        onConfirm={() => {
+          if (deletingDoc) deleteMutation.mutate(deletingDoc);
+        }}
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import {
   ArrowLeft,
+  CheckCircle2,
   CheckSquare,
   Edit3,
   FileText,
@@ -20,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatMinorCurrency } from '../../lib/currency';
+import { getLocalTodayIso, isValidIsoDate, normalizeDateIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
 import type {
   MilestoneRecord,
@@ -27,7 +29,9 @@ import type {
   ProjectStatus,
   ProjectType,
   TaskPriority,
+  TaskRecord,
 } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -48,29 +52,41 @@ const MILESTONE_STATUS_TONES: Record<MilestoneRecord['status'], 'nominal' | 'war
   missed: 'critical',
 };
 
-const projectFormSchema = z.object({
-  code: z.string().min(2, 'Project code is required (e.g. PRJ-001).'),
-  name: z.string().min(2, 'Project name is required.'),
-  description: z.string().optional(),
-  project_type: z.enum(['internal', 'product_engineering', 'client_delivery', 'operations']),
-  status: z.enum(['planning', 'active', 'on_hold', 'completed', 'cancelled']),
-  business_unit_id: z.string().optional(),
-  product_id: z.string().optional(),
-  owner_id: z.string().optional(),
-  project_manager_id: z.string().optional(),
-  start_date: z.string().optional(),
-  due_date: z.string().optional(),
-  budget_major: z.string().optional(),
-  budget_currency: z.string().min(3).max(3),
-  progress_pct: z.number().min(0).max(100),
-});
+const optionalDateField = z
+  .string()
+  .optional()
+  .refine((val) => !val || isValidIsoDate(val), {
+    message: 'Enter a valid date (YYYY-MM-DD).',
+  });
+
+const projectFormSchema = z
+  .object({
+    code: z.string().min(2, 'Project code is required (e.g. PRJ-001).'),
+    name: z.string().min(2, 'Project name is required.'),
+    description: z.string().optional(),
+    project_type: z.enum(['internal', 'product_engineering', 'client_delivery', 'operations']),
+    status: z.enum(['planning', 'active', 'on_hold', 'completed', 'cancelled']),
+    business_unit_id: z.string().optional(),
+    product_id: z.string().optional(),
+    owner_id: z.string().optional(),
+    project_manager_id: z.string().optional(),
+    start_date: optionalDateField,
+    due_date: optionalDateField,
+    budget_major: z.string().optional(),
+    budget_currency: z.string().min(3).max(3),
+    progress_pct: z.number().min(0).max(100),
+  })
+  .refine((vals) => !vals.start_date || !vals.due_date || vals.due_date >= vals.start_date, {
+    message: 'Due date cannot be earlier than start date.',
+    path: ['due_date'],
+  });
 
 type ProjectFormValues = z.infer<typeof projectFormSchema>;
 
 const milestoneSchema = z.object({
   title: z.string().min(2, 'Milestone title is required.'),
   description: z.string().optional(),
-  due_date: z.string().optional(),
+  due_date: optionalDateField,
   status: z.enum(['planned', 'in_progress', 'completed', 'missed']),
 });
 
@@ -103,6 +119,14 @@ export function ProjectsPage() {
   const [unitFilter, setUnitFilter] = useState('all');
 
   const [formModalMode, setFormModalMode] = useState<'closed' | 'create' | 'edit'>('closed');
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
+  const [editingMilestone, setEditingMilestone] = useState<MilestoneRecord | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { kind: 'project'; item: ProjectRecord }
+    | { kind: 'milestone'; item: MilestoneRecord }
+    | { kind: 'task'; item: TaskRecord }
+    | null
+  >(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   // Detail sub-forms state
@@ -113,6 +137,7 @@ export function ProjectsPage() {
   const [quickTaskTitle, setQuickTaskTitle] = useState('');
   const [quickTaskPriority, setQuickTaskPriority] = useState<TaskPriority>('medium');
   const [quickTaskAssignee, setQuickTaskAssignee] = useState('');
+  const [quickTaskDueDate, setQuickTaskDueDate] = useState('');
 
   useEffect(() => {
     const paramProject = searchParams.get('project');
@@ -229,7 +254,7 @@ export function ProjectsPage() {
       product_id: '',
       owner_id: currentUser?.id ?? '',
       project_manager_id: currentUser?.id ?? '',
-      start_date: new Date().toISOString().slice(0, 10),
+      start_date: getLocalTodayIso(),
       due_date: '',
       budget_major: '0',
       budget_currency: defaultCurrency,
@@ -238,6 +263,16 @@ export function ProjectsPage() {
   });
 
   const milestoneForm = useForm<MilestoneFormValues>({
+    resolver: zodResolver(milestoneSchema),
+    defaultValues: {
+      title: '',
+      description: '',
+      due_date: '',
+      status: 'planned',
+    },
+  });
+
+  const editMilestoneForm = useForm<MilestoneFormValues>({
     resolver: zodResolver(milestoneSchema),
     defaultValues: {
       title: '',
@@ -259,6 +294,7 @@ export function ProjectsPage() {
 
   const openCreateModal = () => {
     setActionError(null);
+    setEditingProjectId(null);
     projectForm.reset({
       code: `PRJ-${String(projects.length + 1).padStart(3, '0')}`,
       name: '',
@@ -269,7 +305,7 @@ export function ProjectsPage() {
       product_id: '',
       owner_id: currentUser?.id ?? '',
       project_manager_id: currentUser?.id ?? '',
-      start_date: new Date().toISOString().slice(0, 10),
+      start_date: getLocalTodayIso(),
       due_date: '',
       budget_major: '0',
       budget_currency: defaultCurrency,
@@ -280,6 +316,7 @@ export function ProjectsPage() {
 
   const openEditModal = (project: ProjectRecord) => {
     setActionError(null);
+    setEditingProjectId(project.id);
     projectForm.reset({
       code: project.code,
       name: project.name,
@@ -290,13 +327,24 @@ export function ProjectsPage() {
       product_id: project.product_id ?? '',
       owner_id: project.owner_id ?? '',
       project_manager_id: project.project_manager_id ?? '',
-      start_date: project.start_date ?? '',
-      due_date: project.due_date ?? '',
+      start_date: normalizeDateIso(project.start_date) ?? '',
+      due_date: normalizeDateIso(project.due_date) ?? '',
       budget_major: minorToMajorInput(project.budget_minor, project.budget_currency),
       budget_currency: project.budget_currency,
       progress_pct: project.progress_pct,
     });
     setFormModalMode('edit');
+  };
+
+  const openEditMilestoneModal = (ms: MilestoneRecord) => {
+    setActionError(null);
+    editMilestoneForm.reset({
+      title: ms.title,
+      description: ms.description ?? '',
+      due_date: normalizeDateIso(ms.due_date) ?? '',
+      status: ms.status,
+    });
+    setEditingMilestone(ms);
   };
 
   const saveProjectMutation = useMutation({
@@ -320,10 +368,10 @@ export function ProjectsPage() {
         budget_currency: currency,
         progress_pct: Math.min(100, Math.max(0, Math.round(vals.progress_pct))),
       };
-      if (formModalMode === 'edit' && selectedProject) {
+      if (formModalMode === 'edit' && editingProjectId) {
         return erpRepository.updateProject(currentUser.id, companyId, {
           ...payload,
-          id: selectedProject.id,
+          id: editingProjectId,
         });
       }
       return erpRepository.createProject(currentUser.id, companyId, payload);
@@ -331,12 +379,62 @@ export function ProjectsPage() {
     onSuccess: async (saved) => {
       await invalidateProjectQueries();
       setFormModalMode('closed');
+      setEditingProjectId(null);
       setSelectedProjectId(saved.id);
       setSearchParams({ project: saved.id });
       setActionError(null);
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to save project.');
+    },
+  });
+
+  const completeProjectMutation = useMutation({
+    mutationFn: async (project: ProjectRecord) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      return erpRepository.updateProject(currentUser.id, companyId, {
+        id: project.id,
+        code: project.code,
+        name: project.name,
+        description: project.description,
+        project_type: project.project_type,
+        status: 'completed',
+        business_unit_id: project.business_unit_id,
+        product_id: project.product_id,
+        client_id: project.client_id,
+        owner_id: project.owner_id,
+        project_manager_id: project.project_manager_id,
+        start_date: project.start_date,
+        due_date: project.due_date,
+        budget_minor: project.budget_minor,
+        budget_currency: project.budget_currency,
+        progress_pct: 100,
+      });
+    },
+    onSuccess: async () => {
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to complete project.');
+    },
+  });
+
+  const deleteProjectMutation = useMutation({
+    mutationFn: async (projectId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteProject(currentUser.id, companyId, projectId);
+    },
+    onSuccess: async (_, projectId) => {
+      if (selectedProjectId === projectId) {
+        clearSelection();
+      }
+      setDeleteTarget(null);
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete project.');
     },
   });
 
@@ -408,9 +506,48 @@ export function ProjectsPage() {
     },
   });
 
+  const updateMilestoneMutation = useMutation({
+    mutationFn: async (vals: MilestoneFormValues) => {
+      if (!currentUser || !companyId || !editingMilestone) throw new Error('No milestone selected.');
+      return erpRepository.updateMilestone(currentUser.id, companyId, {
+        id: editingMilestone.id,
+        title: vals.title,
+        description: vals.description || null,
+        due_date: vals.due_date || null,
+        status: vals.status,
+      });
+    },
+    onSuccess: async () => {
+      setEditingMilestone(null);
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to update milestone.');
+    },
+  });
+
+  const deleteMilestoneMutation = useMutation({
+    mutationFn: async (milestoneId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteMilestone(currentUser.id, companyId, milestoneId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete milestone.');
+    },
+  });
+
   const quickCreateTaskMutation = useMutation({
     mutationFn: async () => {
       if (!currentUser || !companyId || !selectedProjectId || !quickTaskTitle.trim()) return;
+      if (quickTaskDueDate && !isValidIsoDate(quickTaskDueDate)) {
+        throw new Error('Enter a valid task due date (YYYY-MM-DD).');
+      }
       await erpRepository.createTask(currentUser.id, companyId, {
         title: quickTaskTitle.trim(),
         task_type: 'task',
@@ -419,15 +556,49 @@ export function ProjectsPage() {
         assigned_to: quickTaskAssignee || null,
         priority: quickTaskPriority,
         status: 'todo',
+        due_date: quickTaskDueDate || null,
       });
     },
     onSuccess: async () => {
       setQuickTaskTitle('');
+      setQuickTaskDueDate('');
       await invalidateProjectQueries();
       setActionError(null);
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to create linked task.');
+    },
+  });
+
+  const completeTaskMutation = useMutation({
+    mutationFn: async (taskId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.updateTask(currentUser.id, companyId, {
+        id: taskId,
+        status: 'completed',
+      });
+    },
+    onSuccess: async () => {
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to complete task.');
+    },
+  });
+
+  const deleteTaskMutation = useMutation({
+    mutationFn: async (taskId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteTask(currentUser.id, companyId, taskId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProjectQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete task.');
     },
   });
 
@@ -516,14 +687,35 @@ export function ProjectsPage() {
               </div>
 
               {canManageProjects ? (
-                <button
-                  type="button"
-                  onClick={() => openEditModal(selectedProject)}
-                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
-                >
-                  <Edit3 className="h-3.5 w-3.5" />
-                  Edit Project
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  {selectedProject.status !== 'completed' ? (
+                    <button
+                      type="button"
+                      disabled={completeProjectMutation.isPending}
+                      onClick={() => completeProjectMutation.mutate(selectedProject)}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-3 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-950/50"
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      Mark Complete
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => openEditModal(selectedProject)}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                  >
+                    <Edit3 className="h-3.5 w-3.5" />
+                    Edit Project
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeleteTarget({ kind: 'project', item: selectedProject })}
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md border border-red-200 bg-white px-3 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Delete
+                  </button>
+                </div>
               ) : null}
             </div>
 
@@ -703,22 +895,55 @@ export function ProjectsPage() {
                         </div>
                       </div>
                       {canManageProjects ? (
-                        <select
-                          value={ms.status}
-                          onChange={(e) =>
-                            updateMilestoneStatusMutation.mutate({
-                              id: ms.id,
-                              status: e.target.value as MilestoneRecord['status'],
-                            })
-                          }
-                          aria-label={`Status for ${ms.title}`}
-                          className="h-7 rounded border border-slate-200 bg-white px-2 text-[11px] dark:border-[#1E3252] dark:bg-[#060D1A]"
-                        >
-                          <option value="planned">Planned</option>
-                          <option value="in_progress">In Progress</option>
-                          <option value="completed">Completed</option>
-                          <option value="missed">Missed</option>
-                        </select>
+                        <div className="flex items-center gap-1.5">
+                          {ms.status !== 'completed' ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateMilestoneStatusMutation.mutate({
+                                  id: ms.id,
+                                  status: 'completed',
+                                })
+                              }
+                              title="Mark milestone completed"
+                              className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                            </button>
+                          ) : null}
+                          <select
+                            value={ms.status}
+                            onChange={(e) =>
+                              updateMilestoneStatusMutation.mutate({
+                                id: ms.id,
+                                status: e.target.value as MilestoneRecord['status'],
+                              })
+                            }
+                            aria-label={`Status for ${ms.title}`}
+                            className="h-7 rounded border border-slate-200 bg-white px-2 text-[11px] dark:border-[#1E3252] dark:bg-[#060D1A]"
+                          >
+                            <option value="planned">Planned</option>
+                            <option value="in_progress">In Progress</option>
+                            <option value="completed">Completed</option>
+                            <option value="missed">Missed</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => openEditMilestoneModal(ms)}
+                            title="Edit milestone"
+                            className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                          >
+                            <Edit3 className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget({ kind: 'milestone', item: ms })}
+                            title="Delete milestone"
+                            className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       ) : null}
                     </li>
                   ))}
@@ -728,25 +953,33 @@ export function ProjectsPage() {
               {canManageProjects ? (
                 <form
                   onSubmit={milestoneForm.handleSubmit((vals) => createMilestoneMutation.mutate(vals))}
-                  className="mt-4 grid grid-cols-1 gap-2 border-t border-slate-100 pt-4 sm:grid-cols-12 dark:border-[#1E3252]"
+                  className="mt-4 border-t border-slate-100 pt-4 dark:border-[#1E3252]"
                 >
-                  <input
-                    {...milestoneForm.register('title')}
-                    placeholder="New milestone title..."
-                    className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-6 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  />
-                  <input
-                    type="date"
-                    {...milestoneForm.register('due_date')}
-                    className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  />
-                  <button
-                    type="submit"
-                    disabled={createMilestoneMutation.isPending}
-                    className="h-8 rounded bg-[#0B3B66] px-2.5 text-xs font-medium text-white sm:col-span-2 dark:bg-sky-600"
-                  >
-                    Add
-                  </button>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                    <input
+                      {...milestoneForm.register('title')}
+                      placeholder="New milestone title..."
+                      className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-6 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    />
+                    <input
+                      type="date"
+                      aria-label="Milestone due date"
+                      {...milestoneForm.register('due_date')}
+                      className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={createMilestoneMutation.isPending}
+                      className="h-8 rounded bg-[#0B3B66] px-2.5 text-xs font-medium text-white sm:col-span-2 dark:bg-sky-600"
+                    >
+                      Add
+                    </button>
+                  </div>
+                  {milestoneForm.formState.errors.title || milestoneForm.formState.errors.due_date ? (
+                    <p className="mt-1.5 text-[11px] text-red-600">
+                      {milestoneForm.formState.errors.title?.message ?? milestoneForm.formState.errors.due_date?.message}
+                    </p>
+                  ) : null}
                 </form>
               ) : null}
             </section>
@@ -772,12 +1005,12 @@ export function ProjectsPage() {
                   value={quickTaskTitle}
                   onChange={(e) => setQuickTaskTitle(e.target.value)}
                   placeholder="Quick add task linked to this project..."
-                  className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-5 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                  className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
                 />
                 <select
                   value={quickTaskAssignee}
                   onChange={(e) => setQuickTaskAssignee(e.target.value)}
-                  className="h-8 rounded border border-slate-200 bg-white px-2 text-xs sm:col-span-3 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                  className="h-8 rounded border border-slate-200 bg-white px-2 text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
                 >
                   <option value="">Unassigned</option>
                   {members.map((m) => (
@@ -794,6 +1027,14 @@ export function ProjectsPage() {
                   <option value="medium">Medium</option>
                   <option value="low">Low</option>
                 </select>
+                <input
+                  type="date"
+                  value={quickTaskDueDate}
+                  onChange={(e) => setQuickTaskDueDate(e.target.value)}
+                  aria-label="Task due date"
+                  title="Due date"
+                  className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                />
                 <button
                   type="button"
                   disabled={!quickTaskTitle.trim() || quickCreateTaskMutation.isPending}
@@ -818,7 +1059,8 @@ export function ProjectsPage() {
                       <th className="py-2 pr-4 font-medium">Assignee</th>
                       <th className="py-2 pr-4 font-medium">Priority</th>
                       <th className="py-2 pr-4 font-medium">Status</th>
-                      <th className="py-2 font-medium">Due Date</th>
+                      <th className="py-2 pr-4 font-medium">Due Date</th>
+                      {canManageTasks ? <th className="py-2 text-right font-medium">Actions</th> : null}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -841,9 +1083,41 @@ export function ProjectsPage() {
                         <td className="py-2.5 pr-4 capitalize text-slate-700 dark:text-slate-300">
                           {t.status.replace('_', ' ')}
                         </td>
-                        <td className="py-2.5 font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                        <td className="py-2.5 pr-4 font-mono tabular-nums text-slate-600 dark:text-slate-300">
                           {t.due_date ?? '—'}
                         </td>
+                        {canManageTasks ? (
+                          <td className="py-2.5 text-right">
+                            <div className="inline-flex items-center justify-end gap-1">
+                              {t.status !== 'completed' ? (
+                                <button
+                                  type="button"
+                                  disabled={completeTaskMutation.isPending}
+                                  onClick={() => completeTaskMutation.mutate(t.id)}
+                                  title="Mark task completed"
+                                  className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                >
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                </button>
+                              ) : null}
+                              <Link
+                                to={`/tasks?task=${t.id}`}
+                                title="Edit task in Task Board"
+                                className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                              >
+                                <Edit3 className="h-3.5 w-3.5" />
+                              </Link>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteTarget({ kind: 'task', item: t })}
+                                title="Delete task"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>
@@ -992,6 +1266,7 @@ export function ProjectsPage() {
                       <th className="px-4 py-3 text-right">Budget</th>
                       <th className="px-4 py-3 text-right">Progress</th>
                       <th className="px-4 py-3">Status</th>
+                      {canManageProjects ? <th className="px-4 py-3 text-right">Actions</th> : null}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1034,6 +1309,39 @@ export function ProjectsPage() {
                             label={p.status.replace('_', ' ')}
                           />
                         </td>
+                        {canManageProjects ? (
+                          <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                            <div className="inline-flex items-center justify-end gap-1">
+                              {p.status !== 'completed' ? (
+                                <button
+                                  type="button"
+                                  disabled={completeProjectMutation.isPending}
+                                  onClick={() => completeProjectMutation.mutate(p)}
+                                  title="Mark project complete"
+                                  className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                >
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={() => openEditModal(p)}
+                                title="Edit project"
+                                className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                              >
+                                <Edit3 className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteTarget({ kind: 'project', item: p })}
+                                title="Delete project"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>
@@ -1184,6 +1492,9 @@ export function ProjectsPage() {
                   {...projectForm.register('start_date')}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
                 />
+                {projectForm.formState.errors.start_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{projectForm.formState.errors.start_date.message}</p>
+                ) : null}
               </div>
 
               <div>
@@ -1193,6 +1504,9 @@ export function ProjectsPage() {
                   {...projectForm.register('due_date')}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
                 />
+                {projectForm.formState.errors.due_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{projectForm.formState.errors.due_date.message}</p>
+                ) : null}
               </div>
 
               <div>
@@ -1246,6 +1560,122 @@ export function ProjectsPage() {
           </div>
         </div>
       ) : null}
+
+      {/* Edit Milestone Modal */}
+      {editingMilestone ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Milestone
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingMilestone(null)}
+                className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={editMilestoneForm.handleSubmit((vals) => updateMilestoneMutation.mutate(vals))}
+              className="mt-4 space-y-4 text-xs"
+            >
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Milestone Title *</label>
+                <input
+                  {...editMilestoneForm.register('title')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+                {editMilestoneForm.formState.errors.title ? (
+                  <p className="mt-1 text-[11px] text-red-600">{editMilestoneForm.formState.errors.title.message}</p>
+                ) : null}
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Description</label>
+                <textarea
+                  rows={2}
+                  {...editMilestoneForm.register('description')}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-medium text-slate-700 dark:text-slate-300">Due Date</label>
+                  <input
+                    type="date"
+                    {...editMilestoneForm.register('due_date')}
+                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                  />
+                  {editMilestoneForm.formState.errors.due_date ? (
+                    <p className="mt-1 text-[11px] text-red-600">{editMilestoneForm.formState.errors.due_date.message}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                  <select
+                    {...editMilestoneForm.register('status')}
+                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                  >
+                    <option value="planned">Planned</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="missed">Missed</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingMilestone(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateMilestoneMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600"
+                >
+                  {updateMilestoneMutation.isPending ? 'Saving...' : 'Save Milestone'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title={
+          deleteTarget?.kind === 'project'
+            ? 'Delete Project'
+            : deleteTarget?.kind === 'milestone'
+              ? 'Delete Milestone'
+              : 'Delete Task'
+        }
+        description={
+          deleteTarget?.kind === 'project'
+            ? `Permanently delete "${deleteTarget.item.code} · ${deleteTarget.item.name}" and its project allocations and milestones?`
+            : deleteTarget?.kind === 'milestone'
+              ? `Permanently delete the "${deleteTarget.item.title}" milestone?`
+              : deleteTarget?.kind === 'task'
+                ? `Permanently delete task "${deleteTarget.item.title}"?`
+                : ''
+        }
+        isPending={
+          deleteProjectMutation.isPending ||
+          deleteMilestoneMutation.isPending ||
+          deleteTaskMutation.isPending
+        }
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          if (deleteTarget.kind === 'project') deleteProjectMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'milestone') deleteMilestoneMutation.mutate(deleteTarget.item.id);
+          else deleteTaskMutation.mutate(deleteTarget.item.id);
+        }}
+      />
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Navigate, useNavigate } from 'react-router-dom';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -8,7 +8,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { generateRandomNumberPassword } from '../../lib/authCredentials';
 
 const signInSchema = z.object({
-  email: z.string().email('Enter a valid work email address.'),
+  email: z.string().trim().email('Enter a valid work email address.'),
   password: z.string().min(6, 'Password must be at least 6 characters.'),
 });
 
@@ -28,8 +28,11 @@ type BootstrapFormValues = z.infer<typeof bootstrapSchema>;
 
 export function SignInPage() {
   const {
+    isLoading,
+    isAuthenticated,
     isPreviewMode,
     hasAnyUsers,
+    hasPermission,
     signInWithEmail,
     bootstrapFirstAdmin,
     authError,
@@ -96,6 +99,10 @@ export function SignInPage() {
     setPasswordCopied(true);
     setTimeout(() => setPasswordCopied(false), 2000);
   };
+
+  if (!isLoading && isAuthenticated) {
+    return <Navigate to={hasPermission('overview.view') ? '/overview' : '/workspace'} replace />;
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 dark:bg-[#060D1A] dark:text-slate-100">

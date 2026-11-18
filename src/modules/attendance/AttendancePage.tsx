@@ -22,6 +22,7 @@ import { erpRepository } from '../../services/erpRepository';
 import type { AttendanceStatus, LeaveStatus, LeaveType } from '../../types/erp';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
+import { getLocalTodayIso, isValidIsoDate } from '../../lib/date';
 
 type ActiveTab = 'personal' | 'roster' | 'approvals' | 'holidays';
 
@@ -67,19 +68,33 @@ const COMPANY_HOLIDAYS = [
   { date: '2026-12-25', name: 'Year-End Winter Holiday', scope: 'All Business Units' },
 ];
 
-const leaveRequestSchema = z.object({
-  leave_type: z.enum(['annual', 'sick', 'casual', 'parental', 'unpaid']),
-  start_date: z.string().min(10, 'Select start date.'),
-  end_date: z.string().min(10, 'Select end date.'),
-  reason: z.string().min(3, 'Provide a brief reason for your leave request.'),
-  assigned_approver_id: z.string().optional(),
-});
+const leaveRequestSchema = z
+  .object({
+    leave_type: z.enum(['annual', 'sick', 'casual', 'parental', 'unpaid']),
+    start_date: z
+      .string()
+      .min(10, 'Select start date.')
+      .refine((v) => isValidIsoDate(v), 'Enter a valid start date.'),
+    end_date: z
+      .string()
+      .min(10, 'Select end date.')
+      .refine((v) => isValidIsoDate(v), 'Enter a valid end date.'),
+    reason: z.string().min(3, 'Provide a brief reason for your leave request.'),
+    assigned_approver_id: z.string().optional(),
+  })
+  .refine((vals) => vals.end_date >= vals.start_date, {
+    message: 'End date cannot be earlier than start date.',
+    path: ['end_date'],
+  });
 
 type LeaveRequestForm = z.infer<typeof leaveRequestSchema>;
 
 const adminAttendanceSchema = z.object({
   profile_id: z.string().min(1, 'Select a team member.'),
-  work_date: z.string().min(10, 'Select date.'),
+  work_date: z
+    .string()
+    .min(10, 'Select date.')
+    .refine((v) => isValidIsoDate(v), 'Enter a valid work date.'),
   status: z.enum(['present', 'remote', 'half_day', 'absent', 'holiday', 'on_leave']),
   notes: z.string().optional(),
 });
@@ -92,7 +107,7 @@ export function AttendancePage() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const canManage = hasPermission('attendance.manage');
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = getLocalTodayIso();
 
   const initialTab =
     searchParams.get('tab') === 'approvals' && canManage
@@ -341,7 +356,17 @@ export function AttendancePage() {
           ) : null}
           <button
             type="button"
-            onClick={() => setLeaveModalOpen(true)}
+            onClick={() => {
+              const freshToday = getLocalTodayIso();
+              leaveForm.reset({
+                leave_type: 'annual',
+                start_date: freshToday,
+                end_date: freshToday,
+                reason: '',
+                assigned_approver_id: '',
+              });
+              setLeaveModalOpen(true);
+            }}
             className="inline-flex h-9 items-center gap-1.5 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white hover:bg-[#082B4C] dark:bg-sky-600 dark:hover:bg-sky-500"
           >
             <Plus className="h-3.5 w-3.5" />
@@ -919,6 +944,9 @@ export function AttendancePage() {
                     {...leaveForm.register('start_date')}
                     className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
                   />
+                  {leaveForm.formState.errors.start_date ? (
+                    <p className="mt-1 text-red-600">{leaveForm.formState.errors.start_date.message}</p>
+                  ) : null}
                 </div>
                 <div>
                   <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
@@ -929,6 +957,9 @@ export function AttendancePage() {
                     {...leaveForm.register('end_date')}
                     className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
                   />
+                  {leaveForm.formState.errors.end_date ? (
+                    <p className="mt-1 text-red-600">{leaveForm.formState.errors.end_date.message}</p>
+                  ) : null}
                 </div>
               </div>
 
@@ -1032,6 +1063,9 @@ export function AttendancePage() {
                     {...adminAttForm.register('work_date')}
                     className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
                   />
+                  {adminAttForm.formState.errors.work_date ? (
+                    <p className="mt-1 text-red-600">{adminAttForm.formState.errors.work_date.message}</p>
+                  ) : null}
                 </div>
                 <div>
                   <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">

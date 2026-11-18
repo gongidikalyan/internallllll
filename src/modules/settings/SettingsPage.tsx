@@ -4,11 +4,12 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Building2, Check, Plus, RefreshCw, ShieldAlert, ShieldCheck, X } from 'lucide-react';
+import { Building2, Check, Plus, RefreshCw, ShieldAlert, ShieldCheck, Trash2, X } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { BUSINESS_UNIT_LABELS } from '../../lib/navigation';
 import { erpRepository } from '../../services/erpRepository';
 import type { BusinessUnit, BusinessUnitStatus, BusinessUnitType } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { StatusText } from '../../components/ui/StatusText';
 
 type SettingsTab = 'company' | 'business-units' | 'roles' | 'audit' | 'environment';
@@ -59,6 +60,7 @@ export function SettingsPage() {
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [buModalOpen, setBuModalOpen] = useState(false);
   const [editingBu, setEditingBu] = useState<BusinessUnit | null>(null);
+  const [deletingBu, setDeletingBu] = useState<BusinessUnit | null>(null);
   const [roleModalOpen, setRoleModalOpen] = useState(false);
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
 
@@ -208,6 +210,22 @@ export function SettingsPage() {
     },
     onError: (err) => {
       setFeedback({ type: 'error', text: err instanceof Error ? err.message : 'Unable to save business unit.' });
+    },
+  });
+
+  const deleteBuMutation = useMutation({
+    mutationFn: async (buId: string) => {
+      if (!profile || !companyId) throw new Error('No authenticated actor.');
+      await erpRepository.deleteBusinessUnit(profile.id, companyId, buId);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['business_units'] });
+      setDeletingBu(null);
+      setFeedback({ type: 'success', text: 'Business unit deleted.' });
+    },
+    onError: (err) => {
+      setDeletingBu(null);
+      setFeedback({ type: 'error', text: err instanceof Error ? err.message : 'Unable to delete business unit.' });
     },
   });
 
@@ -529,13 +547,23 @@ export function SettingsPage() {
                     </td>
                     {canManageBu ? (
                       <td className="px-6 py-3 text-right">
-                        <button
-                          type="button"
-                          onClick={() => openEditBu(bu)}
-                          className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
-                        >
-                          Edit
-                        </button>
+                        <div className="inline-flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => openEditBu(bu)}
+                            className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeletingBu(bu)}
+                            className="inline-flex items-center gap-1 text-xs font-medium text-red-700 hover:underline dark:text-red-400"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                            Delete
+                          </button>
+                        </div>
                       </td>
                     ) : null}
                   </tr>
@@ -742,6 +770,7 @@ export function SettingsPage() {
               <li>supabase/migrations/0003_rls_and_security_functions.sql</li>
               <li>supabase/migrations/0004_seed_initial_data.sql</li>
               <li>supabase/migrations/0005_seed_finance_accounts_and_categories.sql</li>
+              <li>supabase/migrations/0006_add_tasks_delete_policy.sql</li>
               <li>supabase/functions/create-team-member/index.ts</li>
             </ul>
           </div>
@@ -947,6 +976,21 @@ export function SettingsPage() {
           </div>
         </div>
       ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deletingBu)}
+        title="Delete Business Unit"
+        description={
+          deletingBu
+            ? `Delete business unit "${deletingBu.name}" (${deletingBu.code})? Existing departments, projects, or members referencing it will be unlinked.`
+            : ''
+        }
+        isPending={deleteBuMutation.isPending}
+        onCancel={() => setDeletingBu(null)}
+        onConfirm={() => {
+          if (deletingBu) deleteBuMutation.mutate(deletingBu.id);
+        }}
+      />
     </div>
   );
 }

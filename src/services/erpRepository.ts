@@ -1,4 +1,5 @@
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import { getLocalTodayIso } from '../lib/date';
 import {
   generateRandomNumberPassword,
   generateSaltHex,
@@ -294,6 +295,10 @@ export interface CreateClientInput {
   status: ClientStatus;
 }
 
+export interface UpdateClientInput extends CreateClientInput {
+  id: string;
+}
+
 export interface CreateProposalInput {
   lead_id?: string | null;
   client_id?: string | null;
@@ -306,6 +311,10 @@ export interface CreateProposalInput {
   valid_until?: string | null;
 }
 
+export interface UpdateProposalInput extends CreateProposalInput {
+  id: string;
+}
+
 export interface CreateContractInput {
   client_id: string;
   proposal_id?: string | null;
@@ -316,6 +325,10 @@ export interface CreateContractInput {
   start_date: string;
   end_date?: string | null;
   status: ContractStatus;
+}
+
+export interface UpdateContractInput extends CreateContractInput {
+  id: string;
 }
 
 export interface LogCommunicationInput {
@@ -336,6 +349,14 @@ export interface CreateMilestoneInput {
   status: MilestoneRecord['status'];
 }
 
+export interface UpdateMilestoneInput {
+  id: string;
+  title: string;
+  description?: string | null;
+  due_date?: string | null;
+  status: MilestoneRecord['status'];
+}
+
 export interface CreateFeatureInput {
   product_id: string;
   milestone_id?: string | null;
@@ -346,8 +367,29 @@ export interface CreateFeatureInput {
   owner_id?: string | null;
 }
 
+export interface UpdateFeatureInput {
+  id: string;
+  milestone_id?: string | null;
+  title: string;
+  description?: string | null;
+  priority: TaskPriority;
+  status: FeatureRecord['status'];
+  owner_id?: string | null;
+}
+
 export interface CreateReleaseInput {
   product_id: string;
+  version_tag: string;
+  title: string;
+  release_notes?: string | null;
+  environment: ReleaseRecord['environment'];
+  status: ReleaseRecord['status'];
+  target_date?: string | null;
+  release_manager_id?: string | null;
+}
+
+export interface UpdateReleaseInput {
+  id: string;
   version_tag: string;
   title: string;
   release_notes?: string | null;
@@ -448,6 +490,19 @@ export interface CreateMeetingInput {
   participant_ids?: string[];
 }
 
+export interface UpdateMeetingInput {
+  id: string;
+  business_unit_id?: string | null;
+  project_id?: string | null;
+  title: string;
+  agenda?: string | null;
+  meeting_type: MeetingType;
+  scheduled_start: string;
+  scheduled_end: string;
+  location_or_link?: string | null;
+  status: MeetingStatus;
+}
+
 export interface CreateDecisionInput {
   meeting_id?: string | null;
   business_unit_id?: string | null;
@@ -457,11 +512,23 @@ export interface CreateDecisionInput {
   status: DecisionStatus;
 }
 
+export interface UpdateDecisionInput extends CreateDecisionInput {
+  id: string;
+}
+
 export interface CreateDecisionActionInput {
   decision_id: string;
   title: string;
   owner_id: string;
   due_date?: string | null;
+}
+
+export interface UpdateDecisionActionInput {
+  id: string;
+  title: string;
+  owner_id: string;
+  due_date?: string | null;
+  status: DecisionActionStatus;
 }
 
 export interface CheckInAttendanceInput {
@@ -762,6 +829,34 @@ export const erpRepository = {
     return updated;
   },
 
+  async deleteBusinessUnit(actorId: string, companyId: string, buId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('business_units')
+        .delete()
+        .eq('id', buId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'business_units.manage');
+    const target = state.business_units.find((b) => b.id === buId);
+    if (!target) throw new Error('Business unit not found.');
+    state.business_units = state.business_units.filter((b) => b.id !== buId);
+    state.departments = state.departments.map((d) => (d.business_unit_id === buId ? { ...d, business_unit_id: null } : d));
+    state.profiles = state.profiles.map((p) => (p.primary_business_unit_id === buId ? { ...p, primary_business_unit_id: null } : p));
+    state.projects = state.projects.map((p) => (p.business_unit_id === buId ? { ...p, business_unit_id: null } : p));
+    state.leads = state.leads.map((l) => (l.business_unit_id === buId ? { ...l, business_unit_id: null } : l));
+    state.clients = state.clients.map((c) => (c.business_unit_id === buId ? { ...c, business_unit_id: null } : c));
+    state.meetings = state.meetings.map((m) => (m.business_unit_id === buId ? { ...m, business_unit_id: null } : m));
+    state.decisions = state.decisions.map((d) => (d.business_unit_id === buId ? { ...d, business_unit_id: null } : d));
+    state.documents = state.documents.map((d) => (d.business_unit_id === buId ? { ...d, business_unit_id: null } : d));
+    appendPreviewAudit(state, actorId, 'business_unit.deleted', 'business_unit', buId, { code: target.code, name: target.name });
+    savePreviewState(state);
+  },
+
   async listDepartments(companyId: string): Promise<Department[]> {
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase
@@ -853,6 +948,28 @@ export const erpRepository = {
     appendPreviewAudit(state, actorId, 'department.updated', 'department', updated.id, { code: updated.code, name: updated.name });
     savePreviewState(state);
     return updated;
+  },
+
+  async deleteDepartment(actorId: string, companyId: string, departmentId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('departments')
+        .delete()
+        .eq('id', departmentId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'team.manage');
+    const target = state.departments.find((d) => d.id === departmentId);
+    if (!target) throw new Error('Department not found.');
+    state.departments = state.departments.filter((d) => d.id !== departmentId);
+    state.profiles = state.profiles.map((p) => (p.department_id === departmentId ? { ...p, department_id: null } : p));
+    state.tasks = state.tasks.map((t) => (t.department_id === departmentId ? { ...t, department_id: null } : t));
+    appendPreviewAudit(state, actorId, 'department.deleted', 'department', departmentId, { code: target.code, name: target.name });
+    savePreviewState(state);
   },
 
   async listResourceMemberships(companyId: string, userId?: string): Promise<ResourceMembership[]> {
@@ -1730,6 +1847,30 @@ export const erpRepository = {
     return updated;
   },
 
+  async deleteTask(actorId: string, companyId: string, taskId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('tasks')
+        .delete()
+        .eq('id', taskId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'tasks.manage');
+    const target = state.tasks.find((t) => t.id === taskId);
+    if (!target) throw new Error('Task not found.');
+    state.tasks = state.tasks.filter((t) => t.id !== taskId);
+    state.task_comments = state.task_comments.filter((c) => c.task_id !== taskId);
+    state.task_attachments = state.task_attachments.filter((a) => a.task_id !== taskId);
+    state.task_dependencies = state.task_dependencies.filter((d) => d.task_id !== taskId && d.depends_on_task_id !== taskId);
+    state.task_activity = state.task_activity.filter((a) => a.task_id !== taskId);
+    appendPreviewAudit(state, actorId, 'task.deleted', 'task', taskId, { title: target.title });
+    savePreviewState(state);
+  },
+
   async getTaskDetails(companyId: string, taskId: string): Promise<{
     comments: TaskComment[];
     attachments: TaskAttachment[];
@@ -2150,6 +2291,32 @@ export const erpRepository = {
     return updated;
   },
 
+  async deleteProduct(actorId: string, companyId: string, productId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('products')
+        .delete()
+        .eq('id', productId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'products.manage');
+    const target = state.products.find((p) => p.id === productId);
+    if (!target) throw new Error('Product not found.');
+    state.products = state.products.filter((p) => p.id !== productId);
+    state.features = state.features.filter((f) => f.product_id !== productId);
+    state.releases = state.releases.filter((r) => r.product_id !== productId);
+    state.milestones = state.milestones.filter((m) => m.product_id !== productId);
+    state.tasks = state.tasks.map((t) => (t.product_id === productId ? { ...t, product_id: null } : t));
+    state.projects = state.projects.map((p) => (p.product_id === productId ? { ...p, product_id: null } : p));
+    state.documents = state.documents.map((d) => (d.product_id === productId ? { ...d, product_id: null } : d));
+    appendPreviewAudit(state, actorId, 'product.deleted', 'product', productId, { code: target.code, name: target.name });
+    savePreviewState(state);
+  },
+
   async listProjects(companyId: string): Promise<ProjectRecord[]> {
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase
@@ -2283,6 +2450,31 @@ export const erpRepository = {
     return updated;
   },
 
+  async deleteProject(actorId: string, companyId: string, projectId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('projects')
+        .delete()
+        .eq('id', projectId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'projects.manage');
+    const target = state.projects.find((p) => p.id === projectId);
+    if (!target) throw new Error('Project not found.');
+    state.projects = state.projects.filter((p) => p.id !== projectId);
+    state.project_members = state.project_members.filter((pm) => pm.project_id !== projectId);
+    state.milestones = state.milestones.filter((m) => m.project_id !== projectId);
+    state.tasks = state.tasks.map((t) => (t.project_id === projectId ? { ...t, project_id: null } : t));
+    state.meetings = state.meetings.map((m) => (m.project_id === projectId ? { ...m, project_id: null } : m));
+    state.documents = state.documents.map((d) => (d.project_id === projectId ? { ...d, project_id: null } : d));
+    appendPreviewAudit(state, actorId, 'project.deleted', 'project', projectId, { code: target.code, name: target.name });
+    savePreviewState(state);
+  },
+
   async listProjectMembers(companyId: string, projectId?: string): Promise<ProjectMember[]> {
     if (isSupabaseConfigured && supabase) {
       let q = supabase.from('project_members').select('*').eq('company_id', companyId);
@@ -2337,7 +2529,7 @@ export const erpRepository = {
       profile_id: input.profile_id,
       role_in_project: input.role_in_project.trim() || 'contributor',
       allocation_pct: input.allocation_pct,
-      joined_at: new Date().toISOString().slice(0, 10),
+      joined_at: getLocalTodayIso(),
     };
     state.project_members.push(created);
     savePreviewState(state);
@@ -2451,6 +2643,73 @@ export const erpRepository = {
     }
   },
 
+  async updateMilestone(actorId: string, companyId: string, input: UpdateMilestoneInput): Promise<MilestoneRecord> {
+    const now = new Date().toISOString();
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('milestones')
+        .update({
+          title: input.title.trim(),
+          description: input.description?.trim() || null,
+          due_date: input.due_date || null,
+          status: input.status,
+          completed_at: input.status === 'completed' ? now : null,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as MilestoneRecord;
+    }
+
+    const state = loadPreviewState();
+    const perms = getPreviewUserPermissions(state, actorId);
+    if (!perms.has('projects.manage') && !perms.has('products.manage')) {
+      throw new Error('Authorization denied: requires projects.manage or products.manage.');
+    }
+    const idx = state.milestones.findIndex((m) => m.id === input.id);
+    if (idx === -1) throw new Error('Milestone not found.');
+    const prev = state.milestones[idx];
+    const updated: MilestoneRecord = {
+      ...prev,
+      title: input.title.trim(),
+      description: input.description?.trim() || null,
+      due_date: input.due_date || null,
+      status: input.status,
+      completed_at: input.status === 'completed' ? prev.completed_at ?? now : null,
+      updated_at: now,
+    };
+    state.milestones[idx] = updated;
+    appendPreviewAudit(state, actorId, 'milestone.updated', 'milestone', updated.id, { title: updated.title, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteMilestone(actorId: string, companyId: string, milestoneId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('milestones')
+        .delete()
+        .eq('id', milestoneId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    const perms = getPreviewUserPermissions(state, actorId);
+    if (!perms.has('projects.manage') && !perms.has('products.manage')) {
+      throw new Error('Authorization denied: requires projects.manage or products.manage.');
+    }
+    const target = state.milestones.find((m) => m.id === milestoneId);
+    if (!target) throw new Error('Milestone not found.');
+    state.milestones = state.milestones.filter((m) => m.id !== milestoneId);
+    state.features = state.features.map((f) => (f.milestone_id === milestoneId ? { ...f, milestone_id: null } : f));
+    appendPreviewAudit(state, actorId, 'milestone.deleted', 'milestone', milestoneId, { title: target.title });
+    savePreviewState(state);
+  },
+
   async listFeatures(companyId: string, productId?: string): Promise<FeatureRecord[]> {
     if (isSupabaseConfigured && supabase) {
       let query = supabase
@@ -2533,6 +2792,66 @@ export const erpRepository = {
       target.updated_at = new Date().toISOString();
       savePreviewState(state);
     }
+  },
+
+  async updateFeature(actorId: string, companyId: string, input: UpdateFeatureInput): Promise<FeatureRecord> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('features')
+        .update({
+          milestone_id: input.milestone_id || null,
+          title: input.title.trim(),
+          description: input.description?.trim() || null,
+          priority: input.priority,
+          status: input.status,
+          owner_id: input.owner_id || null,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as FeatureRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'products.manage');
+    const idx = state.features.findIndex((f) => f.id === input.id);
+    if (idx === -1) throw new Error('Feature not found.');
+    const updated: FeatureRecord = {
+      ...state.features[idx],
+      milestone_id: input.milestone_id || null,
+      title: input.title.trim(),
+      description: input.description?.trim() || null,
+      priority: input.priority,
+      status: input.status,
+      owner_id: input.owner_id || null,
+      updated_at: new Date().toISOString(),
+    };
+    state.features[idx] = updated;
+    appendPreviewAudit(state, actorId, 'feature.updated', 'feature', updated.id, { title: updated.title, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteFeature(actorId: string, companyId: string, featureId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('features')
+        .delete()
+        .eq('id', featureId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'products.manage');
+    const target = state.features.find((f) => f.id === featureId);
+    if (!target) throw new Error('Feature not found.');
+    state.features = state.features.filter((f) => f.id !== featureId);
+    appendPreviewAudit(state, actorId, 'feature.deleted', 'feature', featureId, { title: target.title });
+    savePreviewState(state);
   },
 
   async listReleases(companyId: string, productId?: string): Promise<ReleaseRecord[]> {
@@ -2626,6 +2945,72 @@ export const erpRepository = {
       target.updated_at = now;
       savePreviewState(state);
     }
+  },
+
+  async updateRelease(actorId: string, companyId: string, input: UpdateReleaseInput): Promise<ReleaseRecord> {
+    const now = new Date().toISOString();
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('releases')
+        .update({
+          version_tag: input.version_tag.trim(),
+          title: input.title.trim(),
+          release_notes: input.release_notes?.trim() || null,
+          environment: input.environment,
+          status: input.status,
+          target_date: input.target_date || null,
+          released_at: input.status === 'released' ? now : null,
+          release_manager_id: input.release_manager_id || null,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as ReleaseRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'products.manage');
+    const idx = state.releases.findIndex((r) => r.id === input.id);
+    if (idx === -1) throw new Error('Release not found.');
+    const prev = state.releases[idx];
+    const updated: ReleaseRecord = {
+      ...prev,
+      version_tag: input.version_tag.trim(),
+      title: input.title.trim(),
+      release_notes: input.release_notes?.trim() || null,
+      environment: input.environment,
+      status: input.status,
+      target_date: input.target_date || null,
+      released_at: input.status === 'released' ? prev.released_at ?? now : null,
+      release_manager_id: input.release_manager_id || null,
+      updated_at: now,
+    };
+    state.releases[idx] = updated;
+    appendPreviewAudit(state, actorId, 'release.updated', 'release', updated.id, { version_tag: updated.version_tag, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteRelease(actorId: string, companyId: string, releaseId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('releases')
+        .delete()
+        .eq('id', releaseId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'products.manage');
+    const target = state.releases.find((r) => r.id === releaseId);
+    if (!target) throw new Error('Release not found.');
+    state.releases = state.releases.filter((r) => r.id !== releaseId);
+    appendPreviewAudit(state, actorId, 'release.deleted', 'release', releaseId, { version_tag: target.version_tag, title: target.title });
+    savePreviewState(state);
   },
 
   async listBusinessUnitFinanceSummary(companyId: string, businessUnitId: string): Promise<{
@@ -2810,6 +3195,28 @@ export const erpRepository = {
     return updated;
   },
 
+  async deleteLead(actorId: string, companyId: string, leadId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('leads')
+        .delete()
+        .eq('id', leadId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'client_services.manage');
+    const target = state.leads.find((l) => l.id === leadId);
+    if (!target) throw new Error('Lead not found.');
+    state.leads = state.leads.filter((l) => l.id !== leadId);
+    state.proposals = state.proposals.map((p) => (p.lead_id === leadId ? { ...p, lead_id: null } : p));
+    state.client_communications = state.client_communications.filter((c) => c.lead_id !== leadId);
+    appendPreviewAudit(state, actorId, 'lead.deleted', 'lead', leadId, { organization_name: target.organization_name });
+    savePreviewState(state);
+  },
+
   async convertLeadToClient(actorId: string, companyId: string, leadId: string): Promise<ClientRecord> {
     if (isSupabaseConfigured && supabase) {
       const { data: leadData, error: leadErr } = await supabase
@@ -2976,6 +3383,73 @@ export const erpRepository = {
       client.updated_at = new Date().toISOString();
       savePreviewState(state);
     }
+  },
+
+  async updateClient(actorId: string, companyId: string, input: UpdateClientInput): Promise<ClientRecord> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('clients')
+        .update({
+          business_unit_id: input.business_unit_id || null,
+          name: input.name.trim(),
+          industry: input.industry?.trim() || null,
+          website: input.website?.trim() || null,
+          billing_address: input.billing_address?.trim() || null,
+          account_owner_id: input.account_owner_id || null,
+          status: input.status,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as ClientRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'client_services.manage');
+    const idx = state.clients.findIndex((c) => c.id === input.id);
+    if (idx === -1) throw new Error('Client not found.');
+    const updated: ClientRecord = {
+      ...state.clients[idx],
+      business_unit_id: input.business_unit_id || null,
+      name: input.name.trim(),
+      industry: input.industry?.trim() || null,
+      website: input.website?.trim() || null,
+      billing_address: input.billing_address?.trim() || null,
+      account_owner_id: input.account_owner_id || null,
+      status: input.status,
+      updated_at: new Date().toISOString(),
+    };
+    state.clients[idx] = updated;
+    appendPreviewAudit(state, actorId, 'client.updated', 'client', updated.id, { name: updated.name, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteClient(actorId: string, companyId: string, clientId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('clients')
+        .delete()
+        .eq('id', clientId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'client_services.manage');
+    const target = state.clients.find((c) => c.id === clientId);
+    if (!target) throw new Error('Client not found.');
+    state.clients = state.clients.filter((c) => c.id !== clientId);
+    state.client_contacts = state.client_contacts.filter((cc) => cc.client_id !== clientId);
+    state.client_communications = state.client_communications.filter((cm) => cm.client_id !== clientId);
+    state.leads = state.leads.map((l) => (l.client_id === clientId ? { ...l, client_id: null } : l));
+    state.projects = state.projects.map((p) => (p.client_id === clientId ? { ...p, client_id: null } : p));
+    state.proposals = state.proposals.map((p) => (p.client_id === clientId ? { ...p, client_id: null } : p));
+    appendPreviewAudit(state, actorId, 'client.deleted', 'client', clientId, { name: target.name });
+    savePreviewState(state);
   },
 
   async listClientContacts(companyId: string, clientId?: string): Promise<ClientContact[]> {
@@ -3384,6 +3858,79 @@ export const erpRepository = {
     return prop;
   },
 
+  async updateProposal(actorId: string, companyId: string, input: UpdateProposalInput): Promise<ProposalRecord> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('proposals')
+        .update({
+          lead_id: input.lead_id || null,
+          client_id: input.client_id || null,
+          proposal_number: input.proposal_number.trim().toUpperCase(),
+          title: input.title.trim(),
+          scope_summary: input.scope_summary.trim(),
+          estimated_hours: input.estimated_hours ?? null,
+          proposed_amount_minor: Math.max(0, Math.trunc(input.proposed_amount_minor)),
+          currency_code: input.currency_code.toUpperCase(),
+          valid_until: input.valid_until || null,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as ProposalRecord;
+    }
+
+    const state = loadPreviewState();
+    const perms = getPreviewUserPermissions(state, actorId);
+    if (!perms.has('client_services.manage') && !perms.has('proposals.commercial_approve')) {
+      throw new Error('Authorization denied: requires client_services.manage or proposals.commercial_approve.');
+    }
+    const idx = state.proposals.findIndex((p) => p.id === input.id);
+    if (idx === -1) throw new Error('Proposal not found.');
+    const updated: ProposalRecord = {
+      ...state.proposals[idx],
+      lead_id: input.lead_id || null,
+      client_id: input.client_id || null,
+      proposal_number: input.proposal_number.trim().toUpperCase(),
+      title: input.title.trim(),
+      scope_summary: input.scope_summary.trim(),
+      estimated_hours: input.estimated_hours ?? null,
+      proposed_amount_minor: Math.max(0, Math.trunc(input.proposed_amount_minor)),
+      currency_code: input.currency_code.toUpperCase(),
+      valid_until: input.valid_until || null,
+      updated_at: new Date().toISOString(),
+    };
+    state.proposals[idx] = updated;
+    appendPreviewAudit(state, actorId, 'proposal.updated', 'proposal', updated.id, { proposal_number: updated.proposal_number });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteProposal(actorId: string, companyId: string, proposalId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('proposals')
+        .delete()
+        .eq('id', proposalId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    const perms = getPreviewUserPermissions(state, actorId);
+    if (!perms.has('client_services.manage') && !perms.has('proposals.commercial_approve')) {
+      throw new Error('Authorization denied: requires client_services.manage or proposals.commercial_approve.');
+    }
+    const target = state.proposals.find((p) => p.id === proposalId);
+    if (!target) throw new Error('Proposal not found.');
+    state.proposals = state.proposals.filter((p) => p.id !== proposalId);
+    state.contracts = state.contracts.map((c) => (c.proposal_id === proposalId ? { ...c, proposal_id: null } : c));
+    appendPreviewAudit(state, actorId, 'proposal.deleted', 'proposal', proposalId, { proposal_number: target.proposal_number });
+    savePreviewState(state);
+  },
+
   async listContracts(companyId: string): Promise<ContractRecord[]> {
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase
@@ -3499,6 +4046,81 @@ export const erpRepository = {
     }
     contract.updated_at = now;
     appendPreviewAudit(state, actorId, 'contract.status_updated', 'contract', contract.id, { status });
+    savePreviewState(state);
+  },
+
+  async updateContract(actorId: string, companyId: string, input: UpdateContractInput): Promise<ContractRecord> {
+    const now = new Date().toISOString();
+    if (isSupabaseConfigured && supabase) {
+      const updates: Record<string, unknown> = {
+        client_id: input.client_id,
+        proposal_id: input.proposal_id || null,
+        contract_number: input.contract_number.trim().toUpperCase(),
+        title: input.title.trim(),
+        contract_value_minor: Math.max(0, Math.trunc(input.contract_value_minor)),
+        currency_code: input.currency_code.toUpperCase(),
+        start_date: input.start_date,
+        end_date: input.end_date || null,
+        status: input.status,
+      };
+      if (input.status === 'active') {
+        updates.approved_by = actorId;
+        updates.signed_at = now;
+      }
+      const { data, error } = await supabase
+        .from('contracts')
+        .update(updates)
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as ContractRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'proposals.commercial_approve');
+    const idx = state.contracts.findIndex((c) => c.id === input.id);
+    if (idx === -1) throw new Error('Contract not found.');
+    const prev = state.contracts[idx];
+    const updated: ContractRecord = {
+      ...prev,
+      client_id: input.client_id,
+      proposal_id: input.proposal_id || null,
+      contract_number: input.contract_number.trim().toUpperCase(),
+      title: input.title.trim(),
+      contract_value_minor: Math.max(0, Math.trunc(input.contract_value_minor)),
+      currency_code: input.currency_code.toUpperCase(),
+      start_date: input.start_date,
+      end_date: input.end_date || null,
+      status: input.status,
+      approved_by: input.status === 'active' ? prev.approved_by ?? actorId : prev.approved_by,
+      signed_at: input.status === 'active' ? prev.signed_at ?? now : prev.signed_at,
+      updated_at: now,
+    };
+    state.contracts[idx] = updated;
+    appendPreviewAudit(state, actorId, 'contract.updated', 'contract', updated.id, { contract_number: updated.contract_number, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteContract(actorId: string, companyId: string, contractId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('contracts')
+        .delete()
+        .eq('id', contractId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'proposals.commercial_approve');
+    const target = state.contracts.find((c) => c.id === contractId);
+    if (!target) throw new Error('Contract not found.');
+    state.contracts = state.contracts.filter((c) => c.id !== contractId);
+    appendPreviewAudit(state, actorId, 'contract.deleted', 'contract', contractId, { contract_number: target.contract_number });
     savePreviewState(state);
   },
 
@@ -3814,7 +4436,7 @@ export const erpRepository = {
           transaction_type: 'reversal',
           amount_minor: -orig.amount_minor,
           currency_code: orig.currency_code,
-          transaction_date: new Date().toISOString().slice(0, 10),
+          transaction_date: getLocalTodayIso(),
           description: `REVERSAL of "${orig.description}": ${cleanReason}`,
           reference_number: orig.reference_number ? `REV-${orig.reference_number}` : null,
           parent_transaction_id: orig.id,
@@ -4112,7 +4734,7 @@ export const erpRepository = {
     if (totalMinor <= 0) {
       throw new Error('Invoice total must be greater than zero.');
     }
-    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayIso = getLocalTodayIso();
     const initialStatus: InvoiceRecord['status'] = input.issue_immediately
       ? input.due_date < todayIso
         ? 'overdue'
@@ -4181,7 +4803,7 @@ export const erpRepository = {
   },
 
   async issueInvoice(actorId: string, companyId: string, invoiceId: string): Promise<InvoiceRecord> {
-    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayIso = getLocalTodayIso();
     if (isSupabaseConfigured && supabase) {
       const { data: existing, error: fErr } = await supabase
         .from('invoices')
@@ -4907,6 +5529,75 @@ export const erpRepository = {
     return mtg;
   },
 
+  async updateMeeting(actorId: string, companyId: string, input: UpdateMeetingInput): Promise<MeetingRecord> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('meetings')
+        .update({
+          business_unit_id: input.business_unit_id || null,
+          project_id: input.project_id || null,
+          title: input.title.trim(),
+          agenda: input.agenda?.trim() || null,
+          meeting_type: input.meeting_type,
+          scheduled_start: input.scheduled_start,
+          scheduled_end: input.scheduled_end,
+          location_or_link: input.location_or_link?.trim() || null,
+          status: input.status,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as MeetingRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const idx = state.meetings.findIndex((m) => m.id === input.id);
+    if (idx === -1) throw new Error('Meeting not found.');
+    const updated: MeetingRecord = {
+      ...state.meetings[idx],
+      business_unit_id: input.business_unit_id || null,
+      project_id: input.project_id || null,
+      title: input.title.trim(),
+      agenda: input.agenda?.trim() || null,
+      meeting_type: input.meeting_type,
+      scheduled_start: input.scheduled_start,
+      scheduled_end: input.scheduled_end,
+      location_or_link: input.location_or_link?.trim() || null,
+      status: input.status,
+      updated_at: new Date().toISOString(),
+    };
+    state.meetings[idx] = updated;
+    appendPreviewAudit(state, actorId, 'meeting.updated', 'meeting', updated.id, { title: updated.title, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteMeeting(actorId: string, companyId: string, meetingId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('meetings')
+        .delete()
+        .eq('id', meetingId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const target = state.meetings.find((m) => m.id === meetingId);
+    if (!target) throw new Error('Meeting not found.');
+    state.meetings = state.meetings.filter((m) => m.id !== meetingId);
+    state.meeting_participants = state.meeting_participants.filter((mp) => mp.meeting_id !== meetingId);
+    state.meeting_notes = state.meeting_notes.filter((mn) => mn.meeting_id !== meetingId);
+    state.decisions = state.decisions.map((d) => (d.meeting_id === meetingId ? { ...d, meeting_id: null } : d));
+    appendPreviewAudit(state, actorId, 'meeting.deleted', 'meeting', meetingId, { title: target.title });
+    savePreviewState(state);
+  },
+
   async listMeetingParticipants(companyId: string, meetingId?: string): Promise<MeetingParticipantRecord[]> {
     if (isSupabaseConfigured && supabase) {
       let q = supabase.from('meeting_participants').select('*').eq('company_id', companyId);
@@ -5164,6 +5855,72 @@ export const erpRepository = {
     return dec;
   },
 
+  async updateDecision(actorId: string, companyId: string, input: UpdateDecisionInput): Promise<DecisionRecord> {
+    const now = new Date().toISOString();
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('decisions')
+        .update({
+          meeting_id: input.meeting_id || null,
+          business_unit_id: input.business_unit_id || null,
+          title: input.title.trim(),
+          context: input.context.trim(),
+          outcome: input.outcome.trim(),
+          status: input.status,
+          ...(input.status === 'approved' ? { decided_by: actorId, decided_at: now } : {}),
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as DecisionRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const idx = state.decisions.findIndex((d) => d.id === input.id);
+    if (idx === -1) throw new Error('Decision record not found.');
+    const prev = state.decisions[idx];
+    const updated: DecisionRecord = {
+      ...prev,
+      meeting_id: input.meeting_id || null,
+      business_unit_id: input.business_unit_id || null,
+      title: input.title.trim(),
+      context: input.context.trim(),
+      outcome: input.outcome.trim(),
+      status: input.status,
+      decided_by: input.status === 'approved' ? prev.decided_by ?? actorId : prev.decided_by,
+      decided_at: input.status === 'approved' ? prev.decided_at ?? now : prev.decided_at,
+      updated_at: now,
+    };
+    state.decisions[idx] = updated;
+    appendPreviewAudit(state, actorId, 'decision.updated', 'decision', updated.id, { title: updated.title, status: updated.status });
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteDecision(actorId: string, companyId: string, decisionId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('decisions')
+        .delete()
+        .eq('id', decisionId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const target = state.decisions.find((d) => d.id === decisionId);
+    if (!target) throw new Error('Decision record not found.');
+    state.decisions = state.decisions.filter((d) => d.id !== decisionId);
+    state.decision_actions = state.decision_actions.filter((a) => a.decision_id !== decisionId);
+    appendPreviewAudit(state, actorId, 'decision.deleted', 'decision', decisionId, { title: target.title });
+    savePreviewState(state);
+  },
+
   async listDecisionActions(companyId: string, decisionId?: string): Promise<DecisionActionRecord[]> {
     if (isSupabaseConfigured && supabase) {
       let q = supabase
@@ -5258,6 +6015,65 @@ export const erpRepository = {
     item.updated_at = new Date().toISOString();
     savePreviewState(state);
     return item;
+  },
+
+  async updateDecisionAction(
+    actorId: string,
+    companyId: string,
+    input: UpdateDecisionActionInput
+  ): Promise<DecisionActionRecord> {
+    if (isSupabaseConfigured && supabase) {
+      const { data, error } = await supabase
+        .from('decision_actions')
+        .update({
+          title: input.title.trim(),
+          owner_id: input.owner_id,
+          due_date: input.due_date || null,
+          status: input.status,
+        })
+        .eq('id', input.id)
+        .eq('company_id', companyId)
+        .select('*')
+        .single();
+      if (error) throw new Error(error.message);
+      return data as DecisionActionRecord;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const idx = state.decision_actions.findIndex((a) => a.id === input.id);
+    if (idx === -1) throw new Error('Decision action item not found.');
+    const updated: DecisionActionRecord = {
+      ...state.decision_actions[idx],
+      title: input.title.trim(),
+      owner_id: input.owner_id,
+      due_date: input.due_date || null,
+      status: input.status,
+      updated_at: new Date().toISOString(),
+    };
+    state.decision_actions[idx] = updated;
+    savePreviewState(state);
+    return updated;
+  },
+
+  async deleteDecisionAction(actorId: string, companyId: string, actionId: string): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      const { error } = await supabase
+        .from('decision_actions')
+        .delete()
+        .eq('id', actionId)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'meetings.manage');
+    const target = state.decision_actions.find((a) => a.id === actionId);
+    if (!target) throw new Error('Decision action item not found.');
+    state.decision_actions = state.decision_actions.filter((a) => a.id !== actionId);
+    appendPreviewAudit(state, actorId, 'decision_action.deleted', 'decision_action', actionId, { title: target.title });
+    savePreviewState(state);
   },
 
   async listAttendanceRecords(companyId: string, profileId?: string): Promise<AttendanceRecord[]> {
@@ -5830,6 +6646,32 @@ export const erpRepository = {
     return doc;
   },
 
+  async deleteDocument(actorId: string, companyId: string, doc: DocumentRecord): Promise<void> {
+    if (isSupabaseConfigured && supabase) {
+      if (doc.storage_path) {
+        await supabase.storage
+          .from(doc.storage_bucket || 'company-documents')
+          .remove([doc.storage_path]);
+      }
+      const { error } = await supabase
+        .from('documents')
+        .delete()
+        .eq('id', doc.id)
+        .eq('company_id', companyId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+
+    const state = loadPreviewState();
+    requirePreviewPermission(state, actorId, 'documents.manage');
+    const target = state.documents.find((d) => d.id === doc.id);
+    if (!target) throw new Error('Document not found.');
+    state.documents = state.documents.filter((d) => d.id !== doc.id);
+    delete state.document_contents[doc.id];
+    appendPreviewAudit(state, actorId, 'document.deleted', 'document', doc.id, { title: target.title });
+    savePreviewState(state);
+  },
+
   async getDocumentDownloadUrl(_companyId: string, doc: DocumentRecord): Promise<{ url: string; fileName: string; isObjectUrl: boolean }> {
     if (isSupabaseConfigured && supabase) {
       const { data, error } = await supabase.storage
@@ -5972,7 +6814,7 @@ function computeCeoMetrics(input: {
   approvals: CeoDashboardMetrics['pendingApprovals'];
   meetings: CeoDashboardMetrics['upcomingMeetings'];
 }): CeoDashboardMetrics {
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = getLocalTodayIso();
 
   const activeTeamMembers = input.profiles.filter((p) => p.status === 'active').length;
   const activeProducts = input.products.filter((p) => p.stage !== 'sunsetting').length;

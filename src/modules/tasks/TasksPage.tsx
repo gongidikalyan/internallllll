@@ -6,6 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import {
   Calendar as CalendarIcon,
+  CheckCircle2,
   CheckSquare,
   ChevronLeft,
   ChevronRight,
@@ -13,15 +14,19 @@ import {
   Link2,
   MessageSquare,
   Paperclip,
+  Pencil,
   Plus,
   Search,
   ShieldAlert,
   Table2,
+  Trash2,
   X,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { addDaysIso, getLocalTodayIso, isValidIsoDate, normalizeDateIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
-import type { TaskPriority, TaskStatus, TaskType } from '../../types/erp';
+import type { TaskPriority, TaskRecord, TaskStatus, TaskType } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -42,20 +47,32 @@ const PRIORITY_TONES: Record<TaskPriority, 'critical' | 'warning' | 'neutral' | 
   low: 'nominal',
 };
 
-const createTaskSchema = z.object({
-  title: z.string().min(2, 'Task title is required.'),
-  description: z.string().optional(),
-  task_type: z.enum(['task', 'bug', 'improvement', 'research']),
-  department_id: z.string().optional(),
-  project_id: z.string().optional(),
-  product_id: z.string().optional(),
-  assigned_to: z.string().optional(),
-  priority: z.enum(['critical', 'high', 'medium', 'low']),
-  status: z.enum(['backlog', 'todo', 'in_progress', 'blocked', 'in_review', 'completed', 'cancelled']),
-  start_date: z.string().optional(),
-  due_date: z.string().optional(),
-  estimated_hours: z.string().optional(),
-});
+const optionalDateField = z
+  .string()
+  .optional()
+  .refine((val) => !val || isValidIsoDate(val), {
+    message: 'Enter a valid date (YYYY-MM-DD).',
+  });
+
+const createTaskSchema = z
+  .object({
+    title: z.string().min(2, 'Task title is required.'),
+    description: z.string().optional(),
+    task_type: z.enum(['task', 'bug', 'improvement', 'research']),
+    department_id: z.string().optional(),
+    project_id: z.string().optional(),
+    product_id: z.string().optional(),
+    assigned_to: z.string().optional(),
+    priority: z.enum(['critical', 'high', 'medium', 'low']),
+    status: z.enum(['backlog', 'todo', 'in_progress', 'blocked', 'in_review', 'completed', 'cancelled']),
+    start_date: optionalDateField,
+    due_date: optionalDateField,
+    estimated_hours: z.string().optional(),
+  })
+  .refine((vals) => !vals.start_date || !vals.due_date || vals.due_date >= vals.start_date, {
+    message: 'Due date cannot be earlier than start date.',
+    path: ['due_date'],
+  });
 
 type CreateTaskForm = z.infer<typeof createTaskSchema>;
 
@@ -78,6 +95,8 @@ export function TasksPage() {
   const [assigneeFilter, setAssigneeFilter] = useState<string>('all');
 
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<TaskRecord | null>(null);
+  const [deletingTask, setDeletingTask] = useState<TaskRecord | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(searchParams.get('task'));
   const [calendarMonth, setCalendarMonth] = useState(() => {
     const d = new Date();
@@ -88,6 +107,9 @@ export function TasksPage() {
   const [depTargetId, setDepTargetId] = useState('');
   const [actualHoursDraft, setActualHoursDraft] = useState('');
   const [completionNotesDraft, setCompletionNotesDraft] = useState('');
+  const [startDateDraft, setStartDateDraft] = useState('');
+  const [dueDateDraft, setDueDateDraft] = useState('');
+  const [unscheduledDueDrafts, setUnscheduledDueDrafts] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const paramTask = searchParams.get('task');
@@ -97,7 +119,7 @@ export function TasksPage() {
   }, [searchParams]);
 
   const canManageTasks = hasPermission('tasks.manage');
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = getLocalTodayIso();
 
   const tasksQuery = useQuery({
     queryKey: ['tasks', companyId],
@@ -155,6 +177,8 @@ export function TasksPage() {
     if (selectedTask) {
       setActualHoursDraft(selectedTask.actual_hours != null ? String(selectedTask.actual_hours) : '');
       setCompletionNotesDraft(selectedTask.completion_notes ?? '');
+      setStartDateDraft(normalizeDateIso(selectedTask.start_date) ?? '');
+      setDueDateDraft(normalizeDateIso(selectedTask.due_date) ?? '');
     }
   }, [selectedTask]);
 
@@ -162,9 +186,10 @@ export function TasksPage() {
     const q = searchTerm.trim().toLowerCase();
     return tasks.filter((t) => {
       if (scope === 'my' && t.assigned_to !== currentUser?.id && t.created_by !== currentUser?.id) return false;
+      const dueIso = normalizeDateIso(t.due_date);
       if (
         scope === 'overdue' &&
-        (!t.due_date || t.due_date >= todayIso || t.status === 'completed' || t.status === 'cancelled')
+        (!dueIso || dueIso >= todayIso || t.status === 'completed' || t.status === 'cancelled')
       ) {
         return false;
       }
@@ -197,6 +222,49 @@ export function TasksPage() {
       estimated_hours: '',
     },
   });
+
+  const editForm = useForm<CreateTaskForm>({
+    resolver: zodResolver(createTaskSchema),
+  });
+
+  const openCreateModal = (prefillDueDate?: string) => {
+    setActionError(null);
+    const defaultStart = prefillDueDate && prefillDueDate < todayIso ? prefillDueDate : todayIso;
+    createForm.reset({
+      title: '',
+      description: '',
+      task_type: 'task',
+      department_id: '',
+      project_id: '',
+      product_id: '',
+      assigned_to: currentUser?.id ?? '',
+      priority: 'medium',
+      status: 'todo',
+      start_date: defaultStart,
+      due_date: prefillDueDate ?? '',
+      estimated_hours: '',
+    });
+    setCreateOpen(true);
+  };
+
+  const openEditTask = (task: TaskRecord) => {
+    setActionError(null);
+    setEditingTask(task);
+    editForm.reset({
+      title: task.title,
+      description: task.description ?? '',
+      task_type: task.task_type,
+      department_id: task.department_id ?? '',
+      project_id: task.project_id ?? '',
+      product_id: task.product_id ?? '',
+      assigned_to: task.assigned_to ?? '',
+      priority: task.priority,
+      status: task.status,
+      start_date: normalizeDateIso(task.start_date) ?? '',
+      due_date: normalizeDateIso(task.due_date) ?? '',
+      estimated_hours: task.estimated_hours != null ? String(task.estimated_hours) : '',
+    });
+  };
 
   const invalidateTaskQueries = async () => {
     await Promise.all([
@@ -231,11 +299,48 @@ export function TasksPage() {
       await invalidateTaskQueries();
       setCreateOpen(false);
       createForm.reset();
+      if (created.due_date) {
+        const dueNorm = normalizeDateIso(created.due_date);
+        if (dueNorm) {
+          const [y, m] = dueNorm.split('-').map(Number);
+          setCalendarMonth(new Date(y, m - 1, 1));
+        }
+      }
       setSelectedTaskId(created.id);
       setActionError(null);
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to create task.');
+    },
+  });
+
+  const saveEditTaskMutation = useMutation({
+    mutationFn: async (vals: CreateTaskForm) => {
+      if (!currentUser || !companyId || !editingTask) throw new Error('No task selected.');
+      const est = vals.estimated_hours ? Number(vals.estimated_hours) : null;
+      return erpRepository.updateTask(currentUser.id, companyId, {
+        id: editingTask.id,
+        title: vals.title,
+        description: vals.description || null,
+        task_type: vals.task_type as TaskType,
+        department_id: vals.department_id || null,
+        project_id: vals.project_id || null,
+        product_id: vals.product_id || null,
+        assigned_to: vals.assigned_to || null,
+        priority: vals.priority as TaskPriority,
+        status: vals.status as TaskStatus,
+        start_date: vals.start_date || null,
+        due_date: vals.due_date || null,
+        estimated_hours: est !== null && !Number.isNaN(est) ? est : null,
+      });
+    },
+    onSuccess: async () => {
+      await invalidateTaskQueries();
+      setEditingTask(null);
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to update task.');
     },
   });
 
@@ -250,6 +355,26 @@ export function TasksPage() {
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to update task.');
+    },
+  });
+
+  const deleteTaskMutation = useMutation({
+    mutationFn: async (taskId: string) => {
+      if (!currentUser || !companyId) throw new Error('No authenticated user.');
+      await erpRepository.deleteTask(currentUser.id, companyId, taskId);
+      return taskId;
+    },
+    onSuccess: async (deletedId) => {
+      if (selectedTaskId === deletedId) {
+        closeTaskDetails();
+      }
+      setDeletingTask(null);
+      await invalidateTaskQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setDeletingTask(null);
+      setActionError(err instanceof Error ? err.message : 'Unable to delete task.');
     },
   });
 
@@ -294,7 +419,7 @@ export function TasksPage() {
     },
   });
 
-  // Calendar grid generation
+  // Calendar grid generation (padded to complete 7-day rows)
   const calendarDays = useMemo(() => {
     const year = calendarMonth.getFullYear();
     const month = calendarMonth.getMonth();
@@ -306,8 +431,41 @@ export function TasksPage() {
       const iso = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
       cells.push({ dateIso: iso, dayNumber: d });
     }
+    while (cells.length % 7 !== 0) {
+      cells.push({ dateIso: null, dayNumber: null });
+    }
     return cells;
   }, [calendarMonth]);
+
+  const unscheduledFilteredTasks = useMemo(
+    () => filteredTasks.filter((t) => !normalizeDateIso(t.due_date)),
+    [filteredTasks]
+  );
+
+  const commitTaskSchedule = (task: TaskRecord, nextStart: string, nextDue: string) => {
+    const cleanStart = nextStart.trim();
+    const cleanDue = nextDue.trim();
+    if (cleanStart && !isValidIsoDate(cleanStart)) {
+      setActionError('Enter a valid start date (YYYY-MM-DD).');
+      return;
+    }
+    if (cleanDue && !isValidIsoDate(cleanDue)) {
+      setActionError('Enter a valid due date (YYYY-MM-DD).');
+      return;
+    }
+    if (cleanStart && cleanDue && cleanDue < cleanStart) {
+      setActionError('Due date cannot be earlier than start date.');
+      return;
+    }
+    const prevStart = normalizeDateIso(task.start_date) ?? '';
+    const prevDue = normalizeDateIso(task.due_date) ?? '';
+    if (cleanStart === prevStart && cleanDue === prevDue) return;
+    updateTaskMutation.mutate({
+      id: task.id,
+      start_date: cleanStart || null,
+      due_date: cleanDue || null,
+    });
+  };
 
   const openTaskDetails = (taskId: string) => {
     setSelectedTaskId(taskId);
@@ -376,10 +534,7 @@ export function TasksPage() {
           {canManageTasks ? (
             <button
               type="button"
-              onClick={() => {
-                setActionError(null);
-                setCreateOpen(true);
-              }}
+              onClick={() => openCreateModal()}
               className="inline-flex h-9 items-center gap-1.5 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white hover:bg-[#082B4C] whitespace-nowrap dark:bg-sky-600 dark:hover:bg-sky-500"
             >
               <Plus className="h-3.5 w-3.5" />
@@ -495,10 +650,10 @@ export function TasksPage() {
         </select>
       </div>
 
-      {/* Empty State */}
+      {/* Empty State (Kanban & Table only; Calendar always stays accessible) */}
       {tasksQuery.isLoading ? (
         <div className="h-64 animate-pulse rounded-lg border border-slate-200 bg-white dark:border-[#1E3252] dark:bg-[#0C1729]" />
-      ) : filteredTasks.length === 0 ? (
+      ) : filteredTasks.length === 0 && viewMode !== 'calendar' ? (
         <EmptyState
           icon={CheckSquare}
           title="No tasks match this view"
@@ -511,7 +666,7 @@ export function TasksPage() {
             canManageTasks ? (
               <button
                 type="button"
-                onClick={() => setCreateOpen(true)}
+                onClick={() => openCreateModal()}
                 className="inline-flex h-9 items-center gap-1.5 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white hover:bg-[#082B4C] dark:bg-sky-600"
               >
                 <Plus className="h-3.5 w-3.5" />
@@ -550,9 +705,10 @@ export function TasksPage() {
 
                 <div className="space-y-2.5">
                   {colTasks.map((task) => {
+                    const dueIso = normalizeDateIso(task.due_date);
                     const isOverdue =
-                      task.due_date !== null &&
-                      task.due_date < todayIso &&
+                      dueIso !== null &&
+                      dueIso < todayIso &&
                       task.status !== 'completed' &&
                       task.status !== 'cancelled';
                     return (
@@ -600,6 +756,52 @@ export function TasksPage() {
                             ) : null}
                           </div>
                         </button>
+                        {(canManageTasks || task.assigned_to === currentUser?.id) ? (
+                          <div className="mt-2.5 flex items-center justify-end gap-1.5 border-t border-slate-100 pt-2 dark:border-[#1E3252]">
+                            {task.status !== 'completed' ? (
+                              <button
+                                type="button"
+                                disabled={updateTaskMutation.isPending}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updateTaskMutation.mutate({ id: task.id, status: 'completed' });
+                                }}
+                                className="inline-flex h-6 items-center gap-1 rounded border border-emerald-200 px-2 text-[11px] font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-40 dark:border-emerald-900/50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                title="Mark completed"
+                              >
+                                <CheckCircle2 className="h-3 w-3" />
+                                Complete
+                              </button>
+                            ) : null}
+                            {canManageTasks ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openEditTask(task);
+                                  }}
+                                  className="inline-flex h-6 items-center gap-1 rounded border border-slate-200 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
+                                  title="Edit task"
+                                >
+                                  <Pencil className="h-3 w-3" />
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setDeletingTask(task);
+                                  }}
+                                  className="inline-flex h-6 items-center gap-1 rounded border border-red-200 px-2 text-[11px] font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
+                                  title="Delete task"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                     );
                   })}
@@ -624,10 +826,13 @@ export function TasksPage() {
                   <th className="px-4 py-3">Status</th>
                   <th className="px-4 py-3">Due Date</th>
                   <th className="px-4 py-3 text-right">Est / Actual</th>
+                  <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
-                {filteredTasks.map((t) => (
+                {filteredTasks.map((t) => {
+                  const canComplete = canManageTasks || t.assigned_to === currentUser?.id;
+                  return (
                   <tr
                     key={t.id}
                     onClick={() => openTaskDetails(t.id)}
@@ -659,8 +864,47 @@ export function TasksPage() {
                     <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300">
                       {t.estimated_hours ?? 0}h / {t.actual_hours ?? 0}h
                     </td>
+                    <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                      <div className="inline-flex items-center justify-end gap-1.5">
+                        {canComplete && t.status !== 'completed' ? (
+                          <button
+                            type="button"
+                            disabled={updateTaskMutation.isPending}
+                            onClick={() => updateTaskMutation.mutate({ id: t.id, status: 'completed' })}
+                            className="inline-flex h-7 items-center gap-1 rounded border border-emerald-200 px-2 text-[11px] font-medium text-emerald-700 hover:bg-emerald-50 disabled:opacity-40 dark:border-emerald-900/50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                            title="Complete task"
+                          >
+                            <CheckCircle2 className="h-3 w-3" />
+                            Complete
+                          </button>
+                        ) : null}
+                        {canManageTasks ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openEditTask(t)}
+                              className="inline-flex h-7 items-center gap-1 rounded border border-slate-200 px-2 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
+                              title="Edit task"
+                            >
+                              <Pencil className="h-3 w-3" />
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setDeletingTask(t)}
+                              className="inline-flex h-7 items-center gap-1 rounded border border-red-200 px-2 text-[11px] font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
+                              title="Delete task"
+                            >
+                              <Trash2 className="h-3 w-3" />
+                              Delete
+                            </button>
+                          </>
+                        ) : null}
+                      </div>
+                    </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -668,69 +912,207 @@ export function TasksPage() {
       ) : null}
 
       {/* VIEW 3: CALENDAR VIEW */}
-      {!tasksQuery.isLoading && filteredTasks.length > 0 && viewMode === 'calendar' ? (
-        <section className="rounded-lg border border-slate-200 bg-white p-5 dark:border-[#1E3252] dark:bg-[#0C1729]">
-          <div className="mb-4 flex items-center justify-between">
-            <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
-              {calendarMonth.toLocaleString('en-US', { month: 'long', year: 'numeric' })}
-            </h2>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))}
-                className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252]"
-                aria-label="Previous month"
-              >
-                <ChevronLeft className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))}
-                className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252]"
-                aria-label="Next month"
-              >
-                <ChevronRight className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-7 gap-px overflow-hidden rounded border border-slate-200 bg-slate-200 dark:border-[#1E3252] dark:bg-[#1E3252]">
-            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => (
-              <div key={day} className="bg-slate-50 px-2 py-2 text-center text-[11px] font-semibold text-slate-600 dark:bg-[#091221] dark:text-slate-400">
-                {day}
+      {!tasksQuery.isLoading && viewMode === 'calendar' ? (
+        <div className="space-y-5">
+          <section className="rounded-lg border border-slate-200 bg-white p-5 dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                  {calendarMonth.toLocaleString('en-US', { month: 'long', year: 'numeric' })}
+                </h2>
+                <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  Tasks appear on their due date{canManageTasks ? ' · Click + on any day to add a task with that due date' : ''}
+                </p>
               </div>
-            ))}
-            {calendarDays.map((cell, idx) => {
-              const dayTasks = cell.dateIso ? filteredTasks.filter((t) => t.due_date === cell.dateIso) : [];
-              return (
-                <div
-                  key={idx}
-                  className="min-h-[92px] bg-white p-2 dark:bg-[#0C1729]"
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const [y, m] = todayIso.split('-').map(Number);
+                    setCalendarMonth(new Date(y, m - 1, 1));
+                  }}
+                  className="inline-flex h-8 items-center rounded border border-slate-200 px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
                 >
-                  {cell.dayNumber ? (
-                    <>
-                      <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
-                        {cell.dayNumber}
-                      </div>
-                      <div className="mt-1 space-y-1">
-                        {dayTasks.map((dt) => (
-                          <button
-                            key={dt.id}
-                            type="button"
-                            onClick={() => openTaskDetails(dt.id)}
-                            className="block w-full truncate rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-left text-[11px] font-medium text-slate-800 hover:border-[#0B3B66] dark:border-[#1E3252] dark:bg-[#13233C] dark:text-slate-200"
-                          >
-                            {dt.title}
-                          </button>
-                        ))}
-                      </div>
-                    </>
-                  ) : null}
+                  Today
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252] dark:hover:bg-[#13233C]"
+                  aria-label="Previous month"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252] dark:hover:bg-[#13233C]"
+                  aria-label="Next month"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-7 gap-px overflow-hidden rounded border border-slate-200 bg-slate-200 dark:border-[#1E3252] dark:bg-[#1E3252]">
+              {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => (
+                <div key={day} className="bg-slate-50 px-2 py-2 text-center text-[11px] font-semibold text-slate-600 dark:bg-[#091221] dark:text-slate-400">
+                  {day}
                 </div>
-              );
-            })}
-          </div>
-        </section>
+              ))}
+              {calendarDays.map((cell, idx) => {
+                const dayDueTasks = cell.dateIso
+                  ? filteredTasks.filter((t) => normalizeDateIso(t.due_date) === cell.dateIso)
+                  : [];
+                const dayStartOnlyTasks = cell.dateIso
+                  ? filteredTasks.filter(
+                      (t) => !normalizeDateIso(t.due_date) && normalizeDateIso(t.start_date) === cell.dateIso
+                    )
+                  : [];
+                const isTodayCell = cell.dateIso === todayIso;
+                return (
+                  <div
+                    key={idx}
+                    className={`group min-h-[104px] p-2 ${
+                      cell.dateIso
+                        ? isTodayCell
+                          ? 'bg-sky-50/60 dark:bg-[#10243E]'
+                          : 'bg-white dark:bg-[#0C1729]'
+                        : 'bg-slate-50/70 dark:bg-[#091221]'
+                    }`}
+                  >
+                    {cell.dayNumber && cell.dateIso ? (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <span
+                            className={`font-mono text-[11px] ${
+                              isTodayCell
+                                ? 'rounded bg-[#0B3B66] px-1.5 py-0.5 font-semibold text-white dark:bg-sky-600'
+                                : 'text-slate-500 dark:text-slate-400'
+                            }`}
+                          >
+                            {cell.dayNumber}
+                          </span>
+                          {canManageTasks ? (
+                            <button
+                              type="button"
+                              onClick={() => openCreateModal(cell.dateIso!)}
+                              title={`Add task due ${cell.dateIso}`}
+                              aria-label={`Add task due ${cell.dateIso}`}
+                              className="inline-flex h-5 w-5 items-center justify-center rounded border border-transparent text-slate-400 opacity-70 hover:border-slate-200 hover:bg-slate-100 hover:text-slate-800 group-hover:opacity-100 dark:hover:border-[#1E3252] dark:hover:bg-[#13233C] dark:hover:text-white"
+                            >
+                              <Plus className="h-3 w-3" />
+                            </button>
+                          ) : null}
+                        </div>
+                        <div className="mt-1.5 space-y-1">
+                          {dayDueTasks.map((dt) => {
+                            const isOverdue =
+                              cell.dateIso! < todayIso &&
+                              dt.status !== 'completed' &&
+                              dt.status !== 'cancelled';
+                            const isCompleted = dt.status === 'completed';
+                            return (
+                              <button
+                                key={dt.id}
+                                type="button"
+                                onClick={() => openTaskDetails(dt.id)}
+                                title={`${dt.title} (${dt.status.replace('_', ' ')})`}
+                                className={`block w-full truncate rounded border px-1.5 py-0.5 text-left text-[11px] font-medium transition-colors ${
+                                  isCompleted
+                                    ? 'border-emerald-200 bg-emerald-50/70 text-emerald-800 line-through dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300'
+                                    : isOverdue
+                                      ? 'border-red-200 bg-red-50 text-red-800 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300'
+                                      : 'border-slate-200 bg-slate-50 text-slate-800 hover:border-[#0B3B66] dark:border-[#1E3252] dark:bg-[#13233C] dark:text-slate-200 dark:hover:border-sky-500'
+                                }`}
+                              >
+                                {dt.title}
+                              </button>
+                            );
+                          })}
+                          {dayStartOnlyTasks.map((st) => (
+                            <button
+                              key={`start-${st.id}`}
+                              type="button"
+                              onClick={() => openTaskDetails(st.id)}
+                              title={`Starts ${cell.dateIso} (no due date set)`}
+                              className="block w-full truncate rounded border border-dashed border-slate-300 bg-slate-50/50 px-1.5 py-0.5 text-left text-[11px] text-slate-600 hover:border-[#0B3B66] dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-400"
+                            >
+                              Start: {st.title}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* Unscheduled Tasks (No Due Date) */}
+          {unscheduledFilteredTasks.length > 0 ? (
+            <section className="rounded-lg border border-slate-200 bg-white p-5 dark:border-[#1E3252] dark:bg-[#0C1729]">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <h3 className="font-display text-sm font-semibold text-slate-900 dark:text-white">
+                    Tasks Without a Due Date ({unscheduledFilteredTasks.length})
+                  </h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Assign a due date here to schedule these tasks onto the monthly calendar grid.
+                  </p>
+                </div>
+              </div>
+              <div className="divide-y divide-slate-100 dark:divide-[#1E3252]">
+                {unscheduledFilteredTasks.map((ut) => {
+                  const draftVal = unscheduledDueDrafts[ut.id] ?? '';
+                  return (
+                    <div key={ut.id} className="flex flex-wrap items-center justify-between gap-3 py-2.5 text-xs">
+                      <button
+                        type="button"
+                        onClick={() => openTaskDetails(ut.id)}
+                        className="min-w-0 flex-1 text-left font-medium text-slate-900 hover:underline dark:text-white"
+                      >
+                        {ut.title}
+                        <span className="ml-2 font-mono text-[11px] font-normal text-slate-400">
+                          {ut.status.replace('_', ' ')}
+                        </span>
+                      </button>
+                      {canManageTasks ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="date"
+                            value={draftVal}
+                            aria-label={`Due date for ${ut.title}`}
+                            onChange={(e) =>
+                              setUnscheduledDueDrafts((prev) => ({
+                                ...prev,
+                                [ut.id]: e.target.value,
+                              }))
+                            }
+                            className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                          />
+                          <button
+                            type="button"
+                            disabled={!isValidIsoDate(draftVal) || updateTaskMutation.isPending}
+                            onClick={() => {
+                              updateTaskMutation.mutate({ id: ut.id, due_date: draftVal });
+                              const [y, m] = draftVal.split('-').map(Number);
+                              setCalendarMonth(new Date(y, m - 1, 1));
+                            }}
+                            className="h-8 rounded bg-[#0B3B66] px-3 text-xs font-medium text-white disabled:opacity-40 dark:bg-sky-600"
+                          >
+                            Set Due Date
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+        </div>
       ) : null}
 
       {/* Create Task Modal */}
@@ -880,6 +1262,9 @@ export function TasksPage() {
                   {...createForm.register('start_date')}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
                 />
+                {createForm.formState.errors.start_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{createForm.formState.errors.start_date.message}</p>
+                ) : null}
               </div>
 
               <div>
@@ -889,6 +1274,26 @@ export function TasksPage() {
                   {...createForm.register('due_date')}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
                 />
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  {[
+                    { label: 'Today', val: todayIso },
+                    { label: '+3d', val: addDaysIso(todayIso, 3) },
+                    { label: '+1w', val: addDaysIso(todayIso, 7) },
+                    { label: 'Clear', val: '' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.label}
+                      type="button"
+                      onClick={() => createForm.setValue('due_date', opt.val, { shouldValidate: true, shouldDirty: true })}
+                      className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {createForm.formState.errors.due_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{createForm.formState.errors.due_date.message}</p>
+                ) : null}
               </div>
 
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
@@ -908,7 +1313,7 @@ export function TasksPage() {
       {selectedTask ? (
         <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/50">
           <div className="flex h-full w-full max-w-2xl flex-col overflow-y-auto border-l border-slate-200 bg-white p-6 shadow-2xl dark:border-[#1E3252] dark:bg-[#0C1729]">
-            <div className="flex items-start justify-between border-b border-slate-100 pb-4 dark:border-[#1E3252]">
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-4 dark:border-[#1E3252]">
               <div>
                 <p className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
                   TASK {selectedTask.id.slice(0, 8)} · Created {selectedTask.created_at.slice(0, 10)}
@@ -917,9 +1322,42 @@ export function TasksPage() {
                   {selectedTask.title}
                 </h2>
               </div>
-              <button type="button" onClick={closeTaskDetails} className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]">
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                {selectedTask.status !== 'completed' && (canManageTasks || selectedTask.assigned_to === currentUser?.id) ? (
+                  <button
+                    type="button"
+                    disabled={updateTaskMutation.isPending}
+                    onClick={() => updateTaskMutation.mutate({ id: selectedTask.id, status: 'completed' })}
+                    className="inline-flex h-8 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Complete
+                  </button>
+                ) : null}
+                {canManageTasks ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => openEditTask(selectedTask)}
+                      className="inline-flex h-8 items-center gap-1 rounded-md border border-slate-200 px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeletingTask(selectedTask)}
+                      className="inline-flex h-8 items-center gap-1 rounded-md border border-red-200 px-2.5 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:text-red-400 dark:hover:bg-red-950/30"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Delete
+                    </button>
+                  </>
+                ) : null}
+                <button type="button" onClick={closeTaskDetails} className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
             {selectedTask.description ? (
@@ -980,16 +1418,61 @@ export function TasksPage() {
               </div>
 
               <div>
-                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400">Due Date</label>
+                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400">Start Date</label>
                 <input
                   type="date"
-                  value={selectedTask.due_date ?? ''}
+                  value={startDateDraft}
                   disabled={!canManageTasks}
-                  onChange={(e) =>
-                    updateTaskMutation.mutate({ id: selectedTask.id, due_date: e.target.value || null })
-                  }
+                  onChange={(e) => setStartDateDraft(e.target.value)}
+                  onBlur={() => commitTaskSchedule(selectedTask, startDateDraft, dueDateDraft)}
                   className="mt-1 h-8 w-full rounded border border-slate-300 bg-white px-2 font-mono text-xs text-slate-900 disabled:opacity-60 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
                 />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400">Due Date</label>
+                <div className="mt-1 flex items-center gap-1.5">
+                  <input
+                    type="date"
+                    value={dueDateDraft}
+                    disabled={!canManageTasks}
+                    onChange={(e) => setDueDateDraft(e.target.value)}
+                    onBlur={() => commitTaskSchedule(selectedTask, startDateDraft, dueDateDraft)}
+                    className="h-8 min-w-0 flex-1 rounded border border-slate-300 bg-white px-2 font-mono text-xs text-slate-900 disabled:opacity-60 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                  />
+                  {canManageTasks ? (
+                    <button
+                      type="button"
+                      disabled={updateTaskMutation.isPending}
+                      onClick={() => commitTaskSchedule(selectedTask, startDateDraft, dueDateDraft)}
+                      className="h-8 shrink-0 rounded bg-[#0B3B66] px-2.5 text-[11px] font-medium text-white hover:bg-[#082B4C] disabled:opacity-40 dark:bg-sky-600"
+                    >
+                      Save
+                    </button>
+                  ) : null}
+                </div>
+                {canManageTasks ? (
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {[
+                      { label: 'Today', val: todayIso },
+                      { label: '+3d', val: addDaysIso(todayIso, 3) },
+                      { label: '+1w', val: addDaysIso(todayIso, 7) },
+                      { label: 'Clear', val: '' },
+                    ].map((opt) => (
+                      <button
+                        key={opt.label}
+                        type="button"
+                        onClick={() => {
+                          setDueDateDraft(opt.val);
+                          commitTaskSchedule(selectedTask, startDateDraft, opt.val);
+                        }}
+                        className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 hover:bg-white dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
 
               <div>
@@ -1197,6 +1680,213 @@ export function TasksPage() {
           </div>
         </div>
       ) : null}
+
+      {/* Edit Task Modal */}
+      {editingTask ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                Edit Task
+              </h2>
+              <button type="button" onClick={() => setEditingTask(null)} className="rounded p-1 text-slate-400">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={editForm.handleSubmit((vals) => saveEditTaskMutation.mutate(vals))}
+              className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2"
+            >
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Title *</label>
+                <input
+                  {...editForm.register('title')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+                {editForm.formState.errors.title ? (
+                  <p className="mt-1 text-[11px] text-red-600">{editForm.formState.errors.title.message}</p>
+                ) : null}
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Description</label>
+                <textarea
+                  rows={3}
+                  {...editForm.register('description')}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Type</label>
+                <select
+                  {...editForm.register('task_type')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="task">Task</option>
+                  <option value="bug">Bug</option>
+                  <option value="improvement">Improvement</option>
+                  <option value="research">Research</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Priority</label>
+                <select
+                  {...editForm.register('priority')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Status</label>
+                <select
+                  {...editForm.register('status')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  {STATUS_COLUMNS.map((s) => (
+                    <option key={s.id} value={s.id}>{s.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Department</label>
+                <select
+                  {...editForm.register('department_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">None</option>
+                  {departments.map((d) => (
+                    <option key={d.id} value={d.id}>{d.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Project (Optional)</label>
+                <select
+                  {...editForm.register('project_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">None</option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>{p.code} · {p.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Product (Optional)</label>
+                <select
+                  {...editForm.register('product_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">None</option>
+                  {products.map((prod) => (
+                    <option key={prod.id} value={prod.id}>{prod.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Assigned User</label>
+                <select
+                  {...editForm.register('assigned_to')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">Unassigned</option>
+                  {members.map((m) => (
+                    <option key={m.id} value={m.id}>{m.full_name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Estimated Hours</label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  {...editForm.register('estimated_hours')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Start Date</label>
+                <input
+                  type="date"
+                  {...editForm.register('start_date')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+                {editForm.formState.errors.start_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{editForm.formState.errors.start_date.message}</p>
+                ) : null}
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Due Date</label>
+                <input
+                  type="date"
+                  {...editForm.register('due_date')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  {[
+                    { label: 'Today', val: todayIso },
+                    { label: '+3d', val: addDaysIso(todayIso, 3) },
+                    { label: '+1w', val: addDaysIso(todayIso, 7) },
+                    { label: 'Clear', val: '' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.label}
+                      type="button"
+                      onClick={() => editForm.setValue('due_date', opt.val, { shouldValidate: true, shouldDirty: true })}
+                      className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {editForm.formState.errors.due_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{editForm.formState.errors.due_date.message}</p>
+                ) : null}
+              </div>
+
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
+                <button type="button" onClick={() => setEditingTask(null)} className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]">
+                  Cancel
+                </button>
+                <button type="submit" disabled={saveEditTaskMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
+                  {saveEditTaskMutation.isPending ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deletingTask)}
+        title="Delete Task"
+        description={
+          deletingTask
+            ? `Permanently delete task "${deletingTask.title}" along with its comments, attachments, and activity log?`
+            : ''
+        }
+        isPending={deleteTaskMutation.isPending}
+        onCancel={() => setDeletingTask(null)}
+        onConfirm={() => {
+          if (deletingTask) deleteTaskMutation.mutate(deletingTask.id);
+        }}
+      />
     </div>
   );
 }

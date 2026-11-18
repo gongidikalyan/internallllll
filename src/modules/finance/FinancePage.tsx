@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatMinorCurrency } from '../../lib/currency';
+import { addDaysIso, getLocalTodayIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
 import type {
   BudgetRecord,
@@ -149,7 +150,7 @@ export function FinancePage() {
   const [payAccountId, setPayAccountId] = useState('');
   const [payCategoryId, setPayCategoryId] = useState('');
   const [payAmountMajor, setPayAmountMajor] = useState('');
-  const [payDate, setPayDate] = useState(new Date().toISOString().slice(0, 10));
+  const [payDate, setPayDate] = useState(getLocalTodayIso());
   const [payMethod, setPayMethod] = useState('Bank Transfer');
   const [payRef, setPayRef] = useState('');
 
@@ -281,7 +282,7 @@ export function FinancePage() {
 
   // Aggregate integer minor-unit KPIs
   const summary = useMemo(() => {
-    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayIso = getLocalTodayIso();
     let actualRevenueMinor = 0;
     let actualExpensesMinor = 0;
     let plannedExpensesMinor = 0;
@@ -453,7 +454,7 @@ export function FinancePage() {
   }, [transactions, unitFilter, typeFilter, searchTerm, categoryMap, accountMap]);
 
   const filteredInvoices = useMemo(() => {
-    const todayIso = new Date().toISOString().slice(0, 10);
+    const todayIso = getLocalTodayIso();
     const q = searchTerm.trim().toLowerCase();
     return invoices.filter((inv) => {
       const effectiveStatus: InvoiceStatus =
@@ -505,7 +506,7 @@ export function FinancePage() {
       project_id: '',
       amount_major: '',
       currency_code: defaultCurrency,
-      transaction_date: new Date().toISOString().slice(0, 10),
+      transaction_date: getLocalTodayIso(),
       description: '',
       reference_number: '',
       submit_for_approval: true,
@@ -523,7 +524,7 @@ export function FinancePage() {
         project_id: '',
         amount_major: '',
         currency_code: defaultCurrency,
-        transaction_date: new Date().toISOString().slice(0, 10),
+        transaction_date: getLocalTodayIso(),
         description: '',
         reference_number: '',
         submit_for_approval: true,
@@ -554,8 +555,8 @@ export function FinancePage() {
       business_unit_id: businessUnits.find((b) => b.unit_type === 'client_services')?.id ?? '',
       project_id: '',
       invoice_number: `INV-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(3, '0')}`,
-      issue_date: new Date().toISOString().slice(0, 10),
-      due_date: new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10),
+      issue_date: getLocalTodayIso(),
+      due_date: addDaysIso(getLocalTodayIso(), 30),
       subtotal_major: '',
       tax_major: '0',
       currency_code: defaultCurrency,
@@ -565,13 +566,14 @@ export function FinancePage() {
 
   useEffect(() => {
     if (invoiceModalOpen) {
+      const freshToday = getLocalTodayIso();
       invoiceForm.reset({
         client_id: clients[0]?.id ?? '',
         business_unit_id: businessUnits.find((b) => b.unit_type === 'client_services')?.id ?? '',
         project_id: '',
         invoice_number: `INV-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(3, '0')}`,
-        issue_date: new Date().toISOString().slice(0, 10),
-        due_date: new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10),
+        issue_date: freshToday,
+        due_date: addDaysIso(freshToday, 30),
         subtotal_major: '',
         tax_major: '0',
         currency_code: defaultCurrency,
@@ -778,7 +780,7 @@ export function FinancePage() {
         ''
     );
     setPayAmountMajor(divisor === 1 ? String(remaining) : (remaining / divisor).toFixed(2));
-    setPayDate(new Date().toISOString().slice(0, 10));
+    setPayDate(getLocalTodayIso());
     setPayMethod('Bank Transfer');
     setPayRef('');
   };
@@ -813,7 +815,7 @@ export function FinancePage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `company-erp-ledger-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `company-erp-ledger-${getLocalTodayIso()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1243,7 +1245,7 @@ export function FinancePage() {
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
                     {filteredInvoices.map((inv) => {
-                      const todayIso = new Date().toISOString().slice(0, 10);
+                      const todayIso = getLocalTodayIso();
                       const effectiveStatus: InvoiceStatus =
                         inv.status !== 'paid' &&
                         inv.status !== 'void' &&

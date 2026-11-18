@@ -6,6 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import {
   Bug,
+  CheckCircle2,
   CheckSquare,
   Edit3,
   FileText,
@@ -15,6 +16,7 @@ import {
   Plus,
   Rocket,
   ShieldAlert,
+  Trash2,
   UserPlus,
   Users,
   Wallet,
@@ -22,6 +24,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatMinorCurrency } from '../../lib/currency';
+import { isValidIsoDate, normalizeDateIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
 import type {
   FeatureRecord,
@@ -32,9 +35,11 @@ import type {
   ReleaseRecord,
   ResourceMembership,
   TaskPriority,
+  TaskRecord,
   TaskStatus,
   TaskType,
 } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -72,17 +77,33 @@ const featureFormSchema = z.object({
 
 type FeatureFormValues = z.infer<typeof featureFormSchema>;
 
+const optionalDateField = z
+  .string()
+  .optional()
+  .refine((val) => !val || isValidIsoDate(val), {
+    message: 'Enter a valid date (YYYY-MM-DD).',
+  });
+
 const releaseFormSchema = z.object({
   version_tag: z.string().min(1, 'Version tag is required (e.g. v1.0.0).'),
   title: z.string().min(2, 'Release title is required.'),
   release_notes: z.string().optional(),
   environment: z.enum(['alpha', 'beta', 'staging', 'production']),
   status: z.enum(['planned', 'in_qa', 'ready', 'released', 'rolled_back']),
-  target_date: z.string().optional(),
+  target_date: optionalDateField,
   release_manager_id: z.string().optional(),
 });
 
 type ReleaseFormValues = z.infer<typeof releaseFormSchema>;
+
+const milestoneFormSchema = z.object({
+  title: z.string().min(2, 'Milestone title is required.'),
+  description: z.string().optional(),
+  due_date: optionalDateField,
+  status: z.enum(['planned', 'in_progress', 'completed', 'missed']),
+});
+
+type MilestoneFormValues = z.infer<typeof milestoneFormSchema>;
 
 export function ProductsPage() {
   const { profile: currentUser, companyId, hasPermission } = useAuth();
@@ -94,6 +115,17 @@ export function ProductsPage() {
   const [taskFilterMode, setTaskFilterMode] = useState<'all' | 'dev' | 'bugs'>('all');
 
   const [productModalMode, setProductModalMode] = useState<'closed' | 'create' | 'edit'>('closed');
+  const [editingMilestone, setEditingMilestone] = useState<MilestoneRecord | null>(null);
+  const [editingFeature, setEditingFeature] = useState<FeatureRecord | null>(null);
+  const [editingRelease, setEditingRelease] = useState<ReleaseRecord | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { kind: 'product'; item: ProductRecord }
+    | { kind: 'milestone'; item: MilestoneRecord }
+    | { kind: 'feature'; item: FeatureRecord }
+    | { kind: 'task'; item: TaskRecord }
+    | { kind: 'release'; item: ReleaseRecord }
+    | null
+  >(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   // Inline creation drafts
@@ -105,6 +137,7 @@ export function ProductsPage() {
   const [newTaskType, setNewTaskType] = useState<TaskType>('task');
   const [newTaskPriority, setNewTaskPriority] = useState<TaskPriority>('medium');
   const [newTaskAssignee, setNewTaskAssignee] = useState('');
+  const [newTaskDueDate, setNewTaskDueDate] = useState('');
   const [assignMemberId, setAssignMemberId] = useState('');
   const [assignAccessLevel, setAssignAccessLevel] = useState<ResourceMembership['access_level']>('contributor');
 
@@ -279,6 +312,41 @@ export function ProductsPage() {
     },
   });
 
+  const editMilestoneForm = useForm<MilestoneFormValues>({
+    resolver: zodResolver(milestoneFormSchema),
+    defaultValues: {
+      title: '',
+      description: '',
+      due_date: '',
+      status: 'planned',
+    },
+  });
+
+  const editFeatureForm = useForm<FeatureFormValues>({
+    resolver: zodResolver(featureFormSchema),
+    defaultValues: {
+      title: '',
+      description: '',
+      priority: 'medium',
+      status: 'proposed',
+      milestone_id: '',
+      owner_id: '',
+    },
+  });
+
+  const editReleaseForm = useForm<ReleaseFormValues>({
+    resolver: zodResolver(releaseFormSchema),
+    defaultValues: {
+      version_tag: '',
+      title: '',
+      release_notes: '',
+      environment: 'staging',
+      status: 'planned',
+      target_date: '',
+      release_manager_id: currentUser?.id ?? '',
+    },
+  });
+
   const invalidateProductQueries = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ['products'] }),
@@ -325,6 +393,44 @@ export function ProductsPage() {
     setProductModalMode('edit');
   };
 
+  const openEditMilestoneModal = (ms: MilestoneRecord) => {
+    setActionError(null);
+    editMilestoneForm.reset({
+      title: ms.title,
+      description: ms.description ?? '',
+      due_date: normalizeDateIso(ms.due_date) ?? '',
+      status: ms.status,
+    });
+    setEditingMilestone(ms);
+  };
+
+  const openEditFeatureModal = (feat: FeatureRecord) => {
+    setActionError(null);
+    editFeatureForm.reset({
+      title: feat.title,
+      description: feat.description ?? '',
+      priority: feat.priority,
+      status: feat.status,
+      milestone_id: feat.milestone_id ?? '',
+      owner_id: feat.owner_id ?? '',
+    });
+    setEditingFeature(feat);
+  };
+
+  const openEditReleaseModal = (rel: ReleaseRecord) => {
+    setActionError(null);
+    editReleaseForm.reset({
+      version_tag: rel.version_tag,
+      title: rel.title,
+      release_notes: rel.release_notes ?? '',
+      environment: rel.environment,
+      status: rel.status,
+      target_date: normalizeDateIso(rel.target_date) ?? '',
+      release_manager_id: rel.release_manager_id ?? '',
+    });
+    setEditingRelease(rel);
+  };
+
   const saveProductMutation = useMutation({
     mutationFn: async (vals: ProductFormValues) => {
       if (!currentUser || !companyId) throw new Error('No active session.');
@@ -360,9 +466,57 @@ export function ProductsPage() {
     },
   });
 
+  const completeProductMutation = useMutation({
+    mutationFn: async (prod: ProductRecord) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      return erpRepository.updateProduct(currentUser.id, companyId, {
+        id: prod.id,
+        business_unit_id: prod.business_unit_id,
+        code: prod.code,
+        name: prod.name,
+        category: prod.category,
+        description: prod.description,
+        stage: 'live',
+        health_status: prod.health_status,
+        progress_pct: 100,
+        product_owner_id: prod.product_owner_id,
+        tech_lead_id: prod.tech_lead_id,
+      });
+    },
+    onSuccess: async () => {
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to mark product live.');
+    },
+  });
+
+  const deleteProductMutation = useMutation({
+    mutationFn: async (productId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteProduct(currentUser.id, companyId, productId);
+    },
+    onSuccess: async (_, productId) => {
+      setDeleteTarget(null);
+      if (selectedProductId === productId) {
+        setSelectedProductId(null);
+        setSearchParams({});
+      }
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete product.');
+    },
+  });
+
   const createMilestoneMutation = useMutation({
     mutationFn: async () => {
       if (!currentUser || !companyId || !selectedProduct || !msTitle.trim()) return;
+      if (msDueDate && !isValidIsoDate(msDueDate)) {
+        throw new Error('Enter a valid milestone due date (YYYY-MM-DD).');
+      }
       await erpRepository.createMilestone(currentUser.id, companyId, {
         product_id: selectedProduct.id,
         project_id: null,
@@ -394,6 +548,42 @@ export function ProductsPage() {
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to update milestone.');
+    },
+  });
+
+  const updateMilestoneMutation = useMutation({
+    mutationFn: async (vals: MilestoneFormValues) => {
+      if (!currentUser || !companyId || !editingMilestone) throw new Error('No milestone selected.');
+      return erpRepository.updateMilestone(currentUser.id, companyId, {
+        id: editingMilestone.id,
+        title: vals.title,
+        description: vals.description || null,
+        due_date: vals.due_date || null,
+        status: vals.status,
+      });
+    },
+    onSuccess: async () => {
+      setEditingMilestone(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to update milestone.');
+    },
+  });
+
+  const deleteMilestoneMutation = useMutation({
+    mutationFn: async (milestoneId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteMilestone(currentUser.id, companyId, milestoneId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete milestone.');
     },
   });
 
@@ -440,9 +630,50 @@ export function ProductsPage() {
     },
   });
 
+  const updateFeatureMutation = useMutation({
+    mutationFn: async (vals: FeatureFormValues) => {
+      if (!currentUser || !companyId || !editingFeature) throw new Error('No feature selected.');
+      return erpRepository.updateFeature(currentUser.id, companyId, {
+        id: editingFeature.id,
+        milestone_id: vals.milestone_id || null,
+        title: vals.title,
+        description: vals.description || null,
+        priority: vals.priority as TaskPriority,
+        status: vals.status as FeatureRecord['status'],
+        owner_id: vals.owner_id || null,
+      });
+    },
+    onSuccess: async () => {
+      setEditingFeature(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to update feature.');
+    },
+  });
+
+  const deleteFeatureMutation = useMutation({
+    mutationFn: async (featureId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteFeature(currentUser.id, companyId, featureId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete feature.');
+    },
+  });
+
   const createProductTaskMutation = useMutation({
     mutationFn: async () => {
       if (!currentUser || !companyId || !selectedProduct || !newTaskTitle.trim()) return;
+      if (newTaskDueDate && !isValidIsoDate(newTaskDueDate)) {
+        throw new Error('Enter a valid task due date (YYYY-MM-DD).');
+      }
       await erpRepository.createTask(currentUser.id, companyId, {
         title: newTaskTitle.trim(),
         task_type: newTaskType,
@@ -450,10 +681,12 @@ export function ProductsPage() {
         assigned_to: newTaskAssignee || null,
         priority: newTaskPriority,
         status: 'todo',
+        due_date: newTaskDueDate || null,
       });
     },
     onSuccess: async () => {
       setNewTaskTitle('');
+      setNewTaskDueDate('');
       await invalidateProductQueries();
       setActionError(null);
     },
@@ -472,6 +705,21 @@ export function ProductsPage() {
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to update task status.');
+    },
+  });
+
+  const deleteTaskMutation = useMutation({
+    mutationFn: async (taskId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteTask(currentUser.id, companyId, taskId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete task.');
     },
   });
 
@@ -517,6 +765,45 @@ export function ProductsPage() {
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to update release status.');
+    },
+  });
+
+  const updateReleaseMutation = useMutation({
+    mutationFn: async (vals: ReleaseFormValues) => {
+      if (!currentUser || !companyId || !editingRelease) throw new Error('No release selected.');
+      return erpRepository.updateRelease(currentUser.id, companyId, {
+        id: editingRelease.id,
+        version_tag: vals.version_tag,
+        title: vals.title,
+        release_notes: vals.release_notes || null,
+        environment: vals.environment,
+        status: vals.status,
+        target_date: vals.target_date || null,
+        release_manager_id: vals.release_manager_id || null,
+      });
+    },
+    onSuccess: async () => {
+      setEditingRelease(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to update release.');
+    },
+  });
+
+  const deleteReleaseMutation = useMutation({
+    mutationFn: async (releaseId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteRelease(currentUser.id, companyId, releaseId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateProductQueries();
+      setActionError(null);
+    },
+    onError: (err) => {
+      setActionError(err instanceof Error ? err.message : 'Unable to delete release.');
     },
   });
 
@@ -701,14 +988,35 @@ export function ProductsPage() {
                   </div>
                 </div>
                 {canManageProducts ? (
-                  <button
-                    type="button"
-                    onClick={() => openEditProductModal(selectedProduct)}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
-                  >
-                    <Edit3 className="h-3.5 w-3.5" />
-                    Configure
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedProduct.stage !== 'live' || selectedProduct.progress_pct < 100 ? (
+                      <button
+                        type="button"
+                        disabled={completeProductMutation.isPending}
+                        onClick={() => completeProductMutation.mutate(selectedProduct)}
+                        className="inline-flex h-8 items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-3 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-950/50"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        Mark Live
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => openEditProductModal(selectedProduct)}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                    >
+                      <Edit3 className="h-3.5 w-3.5" />
+                      Configure
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteTarget({ kind: 'product', item: selectedProduct })}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-red-200 bg-white px-3 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Delete
+                    </button>
+                  </div>
                 ) : null}
               </div>
             </div>
@@ -1106,21 +1414,54 @@ export function ProductsPage() {
                         </div>
                       </div>
                       {canManageProducts ? (
-                        <select
-                          value={ms.status}
-                          onChange={(e) =>
-                            updateMilestoneStatusMutation.mutate({
-                              id: ms.id,
-                              status: e.target.value as MilestoneRecord['status'],
-                            })
-                          }
-                          className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]"
-                        >
-                          <option value="planned">Planned</option>
-                          <option value="in_progress">In Progress</option>
-                          <option value="completed">Completed</option>
-                          <option value="missed">Missed</option>
-                        </select>
+                        <div className="flex items-center gap-1.5">
+                          {ms.status !== 'completed' ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateMilestoneStatusMutation.mutate({
+                                  id: ms.id,
+                                  status: 'completed',
+                                })
+                              }
+                              title="Mark milestone completed"
+                              className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                            </button>
+                          ) : null}
+                          <select
+                            value={ms.status}
+                            onChange={(e) =>
+                              updateMilestoneStatusMutation.mutate({
+                                id: ms.id,
+                                status: e.target.value as MilestoneRecord['status'],
+                              })
+                            }
+                            className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]"
+                          >
+                            <option value="planned">Planned</option>
+                            <option value="in_progress">In Progress</option>
+                            <option value="completed">Completed</option>
+                            <option value="missed">Missed</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => openEditMilestoneModal(ms)}
+                            title="Edit milestone"
+                            className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                          >
+                            <Edit3 className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget({ kind: 'milestone', item: ms })}
+                            title="Delete milestone"
+                            className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
                       ) : (
                         <StatusText
                           tone={ms.status === 'missed' ? 'critical' : ms.status === 'completed' ? 'nominal' : 'neutral'}
@@ -1203,7 +1544,8 @@ export function ProductsPage() {
                         <th className="py-2 pr-4 font-medium">Feature</th>
                         <th className="py-2 pr-4 font-medium">Priority</th>
                         <th className="py-2 pr-4 font-medium">Owner</th>
-                        <th className="py-2 font-medium">Status</th>
+                        <th className="py-2 pr-4 font-medium">Status</th>
+                        {canManageProducts ? <th className="py-2 text-right font-medium">Actions</th> : null}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1219,7 +1561,7 @@ export function ProductsPage() {
                           <td className="py-2.5 pr-4 text-slate-600 dark:text-slate-300">
                             {f.owner_id ? memberMap.get(f.owner_id) ?? '—' : 'Unassigned'}
                           </td>
-                          <td className="py-2.5">
+                          <td className="py-2.5 pr-4">
                             {canManageProducts ? (
                               <select
                                 value={f.status}
@@ -1244,6 +1586,43 @@ export function ProductsPage() {
                               </span>
                             )}
                           </td>
+                          {canManageProducts ? (
+                            <td className="py-2.5 text-right">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                {f.status !== 'released' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateFeatureStatusMutation.mutate({
+                                        id: f.id,
+                                        status: 'released',
+                                      })
+                                    }
+                                    title="Mark feature released"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => openEditFeatureModal(f)}
+                                  title="Edit feature"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'feature', item: f })}
+                                  title="Delete feature"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          ) : null}
                         </tr>
                       ))}
                     </tbody>
@@ -1293,7 +1672,7 @@ export function ProductsPage() {
                     value={newTaskTitle}
                     onChange={(e) => setNewTaskTitle(e.target.value)}
                     placeholder={`Log task or bug for ${selectedProduct.name}...`}
-                    className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-3 dark:border-[#1E3252] dark:bg-[#060D1A]"
                   />
                   <select
                     value={newTaskType}
@@ -1325,13 +1704,21 @@ export function ProductsPage() {
                       <option key={m.id} value={m.id}>{m.full_name}</option>
                     ))}
                   </select>
+                  <input
+                    type="date"
+                    value={newTaskDueDate}
+                    onChange={(e) => setNewTaskDueDate(e.target.value)}
+                    aria-label="Due date"
+                    title="Due date"
+                    className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                  />
                   <button
                     type="button"
                     disabled={!newTaskTitle.trim() || createProductTaskMutation.isPending}
                     onClick={() => createProductTaskMutation.mutate()}
-                    className="h-8 rounded bg-[#0B3B66] px-3 text-xs font-medium text-white disabled:opacity-40 sm:col-span-2 dark:bg-sky-600"
+                    className="h-8 rounded bg-[#0B3B66] px-3 text-xs font-medium text-white disabled:opacity-40 sm:col-span-1 dark:bg-sky-600"
                   >
-                    Log Item
+                    Log
                   </button>
                 </div>
               ) : null}
@@ -1349,7 +1736,9 @@ export function ProductsPage() {
                         <th className="py-2 pr-4 font-medium">Title</th>
                         <th className="py-2 pr-4 font-medium">Priority</th>
                         <th className="py-2 pr-4 font-medium">Assignee</th>
-                        <th className="py-2 font-medium">Status</th>
+                        <th className="py-2 pr-4 font-medium">Due Date</th>
+                        <th className="py-2 pr-4 font-medium">Status</th>
+                        {canManageTasks ? <th className="py-2 text-right font-medium">Actions</th> : null}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1372,7 +1761,10 @@ export function ProductsPage() {
                           <td className="py-2.5 pr-4 text-slate-600 dark:text-slate-300">
                             {t.assigned_to ? memberMap.get(t.assigned_to) ?? '—' : 'Unassigned'}
                           </td>
-                          <td className="py-2.5">
+                          <td className="py-2.5 pr-4 font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                            {t.due_date ?? '—'}
+                          </td>
+                          <td className="py-2.5 pr-4">
                             <select
                               value={t.status}
                               onChange={(e) =>
@@ -1392,6 +1784,42 @@ export function ProductsPage() {
                               <option value="cancelled">Cancelled</option>
                             </select>
                           </td>
+                          {canManageTasks ? (
+                            <td className="py-2.5 text-right">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                {t.status !== 'completed' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateTaskStatusMutation.mutate({
+                                        id: t.id,
+                                        status: 'completed',
+                                      })
+                                    }
+                                    title="Mark task completed"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <Link
+                                  to={`/tasks?task=${t.id}`}
+                                  title="Edit task in Task Board"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                </Link>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'task', item: t })}
+                                  title="Delete task"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          ) : null}
                         </tr>
                       ))}
                     </tbody>
@@ -1414,39 +1842,51 @@ export function ProductsPage() {
               {canManageProducts ? (
                 <form
                   onSubmit={releaseForm.handleSubmit((vals) => createReleaseMutation.mutate(vals))}
-                  className="mt-4 grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-slate-50/70 p-3 sm:grid-cols-12 dark:border-[#1E3252] dark:bg-[#091221]"
+                  className="mt-4 rounded-md border border-slate-200 bg-slate-50/70 p-3 dark:border-[#1E3252] dark:bg-[#091221]"
                 >
-                  <input
-                    {...releaseForm.register('version_tag')}
-                    placeholder="v1.0.0"
-                    className="h-8 rounded border border-slate-200 bg-white px-2.5 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  />
-                  <input
-                    {...releaseForm.register('title')}
-                    placeholder="Release title..."
-                    className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  />
-                  <select
-                    {...releaseForm.register('environment')}
-                    className="h-8 rounded border border-slate-200 bg-white px-2 text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  >
-                    <option value="alpha">Alpha</option>
-                    <option value="beta">Beta</option>
-                    <option value="staging">Staging / QA</option>
-                    <option value="production">Production</option>
-                  </select>
-                  <input
-                    type="date"
-                    {...releaseForm.register('target_date')}
-                    className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
-                  />
-                  <button
-                    type="submit"
-                    disabled={createReleaseMutation.isPending}
-                    className="h-8 rounded bg-[#0B3B66] px-3 text-xs font-medium text-white sm:col-span-2 dark:bg-sky-600"
-                  >
-                    Schedule Release
-                  </button>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                    <input
+                      {...releaseForm.register('version_tag')}
+                      placeholder="v1.0.0"
+                      className="h-8 rounded border border-slate-200 bg-white px-2.5 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    />
+                    <input
+                      {...releaseForm.register('title')}
+                      placeholder="Release title..."
+                      className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs sm:col-span-4 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    />
+                    <select
+                      {...releaseForm.register('environment')}
+                      className="h-8 rounded border border-slate-200 bg-white px-2 text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    >
+                      <option value="alpha">Alpha</option>
+                      <option value="beta">Beta</option>
+                      <option value="staging">Staging / QA</option>
+                      <option value="production">Production</option>
+                    </select>
+                    <input
+                      type="date"
+                      aria-label="Release target date"
+                      {...releaseForm.register('target_date')}
+                      className="h-8 rounded border border-slate-200 bg-white px-2 font-mono text-xs sm:col-span-2 dark:border-[#1E3252] dark:bg-[#060D1A]"
+                    />
+                    <button
+                      type="submit"
+                      disabled={createReleaseMutation.isPending}
+                      className="h-8 rounded bg-[#0B3B66] px-3 text-xs font-medium text-white sm:col-span-2 dark:bg-sky-600"
+                    >
+                      Schedule Release
+                    </button>
+                  </div>
+                  {releaseForm.formState.errors.version_tag ||
+                  releaseForm.formState.errors.title ||
+                  releaseForm.formState.errors.target_date ? (
+                    <p className="mt-1.5 text-[11px] text-red-600">
+                      {releaseForm.formState.errors.version_tag?.message ??
+                        releaseForm.formState.errors.title?.message ??
+                        releaseForm.formState.errors.target_date?.message}
+                    </p>
+                  ) : null}
                 </form>
               ) : null}
 
@@ -1463,7 +1903,8 @@ export function ProductsPage() {
                         <th className="py-2 pr-4 font-medium">Title</th>
                         <th className="py-2 pr-4 font-medium">Environment</th>
                         <th className="py-2 pr-4 font-medium">Target Date</th>
-                        <th className="py-2 font-medium">QA / Release Status</th>
+                        <th className="py-2 pr-4 font-medium">QA / Release Status</th>
+                        {canManageProducts ? <th className="py-2 text-right font-medium">Actions</th> : null}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1479,7 +1920,7 @@ export function ProductsPage() {
                           <td className="py-2.5 pr-4 font-mono tabular-nums text-slate-600 dark:text-slate-300">
                             {rel.target_date ?? 'TBD'}
                           </td>
-                          <td className="py-2.5">
+                          <td className="py-2.5 pr-4">
                             {canManageProducts ? (
                               <select
                                 value={rel.status}
@@ -1504,6 +1945,43 @@ export function ProductsPage() {
                               />
                             )}
                           </td>
+                          {canManageProducts ? (
+                            <td className="py-2.5 text-right">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                {rel.status !== 'released' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateReleaseStatusMutation.mutate({
+                                        id: rel.id,
+                                        status: 'released',
+                                      })
+                                    }
+                                    title="Mark release shipped"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => openEditReleaseModal(rel)}
+                                  title="Edit release"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'release', item: rel })}
+                                  title="Delete release"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          ) : null}
                         </tr>
                       ))}
                     </tbody>
@@ -1733,6 +2211,348 @@ export function ProductsPage() {
           </div>
         </div>
       ) : null}
+
+      {/* Edit Milestone Modal */}
+      {editingMilestone ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Roadmap Milestone
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingMilestone(null)}
+                className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={editMilestoneForm.handleSubmit((vals) => updateMilestoneMutation.mutate(vals))}
+              className="mt-4 space-y-4 text-xs"
+            >
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Milestone Title *</label>
+                <input
+                  {...editMilestoneForm.register('title')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Scope Summary</label>
+                <textarea
+                  rows={2}
+                  {...editMilestoneForm.register('description')}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-medium text-slate-700 dark:text-slate-300">Target Date</label>
+                  <input
+                    type="date"
+                    {...editMilestoneForm.register('due_date')}
+                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                  />
+                  {editMilestoneForm.formState.errors.due_date ? (
+                    <p className="mt-1 text-[11px] text-red-600">{editMilestoneForm.formState.errors.due_date.message}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                  <select
+                    {...editMilestoneForm.register('status')}
+                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                  >
+                    <option value="planned">Planned</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="missed">Missed</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingMilestone(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateMilestoneMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600"
+                >
+                  {updateMilestoneMutation.isPending ? 'Saving...' : 'Save Milestone'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Edit Feature Modal */}
+      {editingFeature ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Feature
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingFeature(null)}
+                className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={editFeatureForm.handleSubmit((vals) => updateFeatureMutation.mutate(vals))}
+              className="mt-4 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2"
+            >
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Feature Title *</label>
+                <input
+                  {...editFeatureForm.register('title')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Description</label>
+                <textarea
+                  rows={2}
+                  {...editFeatureForm.register('description')}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Priority</label>
+                <select
+                  {...editFeatureForm.register('priority')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                <select
+                  {...editFeatureForm.register('status')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="proposed">Proposed</option>
+                  <option value="scoped">Scoped</option>
+                  <option value="in_development">In Development</option>
+                  <option value="testing">Testing</option>
+                  <option value="released">Released</option>
+                  <option value="deferred">Deferred</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Milestone</label>
+                <select
+                  {...editFeatureForm.register('milestone_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">No milestone</option>
+                  {milestones.map((m) => (
+                    <option key={m.id} value={m.id}>{m.title}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Owner</label>
+                <select
+                  {...editFeatureForm.register('owner_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">Unassigned</option>
+                  {members.map((m) => (
+                    <option key={m.id} value={m.id}>{m.full_name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingFeature(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateFeatureMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600"
+                >
+                  {updateFeatureMutation.isPending ? 'Saving...' : 'Save Feature'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Edit Release Modal */}
+      {editingRelease ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Release
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingRelease(null)}
+                className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={editReleaseForm.handleSubmit((vals) => updateReleaseMutation.mutate(vals))}
+              className="mt-4 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2"
+            >
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Version Tag *</label>
+                <input
+                  {...editReleaseForm.register('version_tag')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Release Title *</label>
+                <input
+                  {...editReleaseForm.register('title')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Environment</label>
+                <select
+                  {...editReleaseForm.register('environment')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="alpha">Alpha</option>
+                  <option value="beta">Beta</option>
+                  <option value="staging">Staging / QA</option>
+                  <option value="production">Production</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                <select
+                  {...editReleaseForm.register('status')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="planned">Planned</option>
+                  <option value="in_qa">In QA</option>
+                  <option value="ready">Ready</option>
+                  <option value="released">Released</option>
+                  <option value="rolled_back">Rolled Back</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Target Date</label>
+                <input
+                  type="date"
+                  {...editReleaseForm.register('target_date')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+                {editReleaseForm.formState.errors.target_date ? (
+                  <p className="mt-1 text-[11px] text-red-600">{editReleaseForm.formState.errors.target_date.message}</p>
+                ) : null}
+              </div>
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Release Manager</label>
+                <select
+                  {...editReleaseForm.register('release_manager_id')}
+                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                >
+                  <option value="">Unassigned</option>
+                  {members.map((m) => (
+                    <option key={m.id} value={m.id}>{m.full_name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-700 dark:text-slate-300">Release Notes</label>
+                <textarea
+                  rows={2}
+                  {...editReleaseForm.register('release_notes')}
+                  className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2.5 text-xs text-slate-900 dark:border-[#1E3252] dark:bg-[#060D1A] dark:text-slate-100"
+                />
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingRelease(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateReleaseMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600"
+                >
+                  {updateReleaseMutation.isPending ? 'Saving...' : 'Save Release'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title={
+          deleteTarget?.kind === 'product'
+            ? 'Delete Product Workspace'
+            : deleteTarget?.kind === 'milestone'
+              ? 'Delete Milestone'
+              : deleteTarget?.kind === 'feature'
+                ? 'Delete Feature'
+                : deleteTarget?.kind === 'task'
+                  ? 'Delete Task / Bug'
+                  : 'Delete Release'
+        }
+        description={
+          deleteTarget?.kind === 'product'
+            ? `Permanently delete "${deleteTarget.item.code} · ${deleteTarget.item.name}" and its milestones, features, and releases?`
+            : deleteTarget?.kind === 'milestone'
+              ? `Permanently delete roadmap milestone "${deleteTarget.item.title}"?`
+              : deleteTarget?.kind === 'feature'
+                ? `Permanently delete feature "${deleteTarget.item.title}"?`
+                : deleteTarget?.kind === 'task'
+                  ? `Permanently delete "${deleteTarget.item.title}"?`
+                  : deleteTarget?.kind === 'release'
+                    ? `Permanently delete release "${deleteTarget.item.version_tag} · ${deleteTarget.item.title}"?`
+                    : ''
+        }
+        isPending={
+          deleteProductMutation.isPending ||
+          deleteMilestoneMutation.isPending ||
+          deleteFeatureMutation.isPending ||
+          deleteTaskMutation.isPending ||
+          deleteReleaseMutation.isPending
+        }
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          if (deleteTarget.kind === 'product') deleteProductMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'milestone') deleteMilestoneMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'feature') deleteFeatureMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'task') deleteTaskMutation.mutate(deleteTarget.item.id);
+          else deleteReleaseMutation.mutate(deleteTarget.item.id);
+        }}
+      />
     </div>
   );
 }

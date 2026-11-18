@@ -7,28 +7,37 @@ import { z } from 'zod';
 import {
   Calendar,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   ClipboardList,
   Clock,
   FileText,
   MapPin,
+  Pencil,
   Plus,
   Search,
+  Trash2,
   Users,
   X,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { getLocalTodayIso, isValidIsoDate, normalizeDateIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
 import type {
+  DecisionActionRecord,
   DecisionActionStatus,
+  DecisionRecord,
   DecisionStatus,
+  MeetingRecord,
   MeetingStatus,
   MeetingType,
   RsvpStatus,
 } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
-type ActiveTab = 'meetings' | 'decisions';
+type ActiveTab = 'meetings' | 'calendar' | 'decisions';
 type TimeFilter = 'upcoming' | 'past' | 'all';
 
 const MEETING_TYPE_LABELS: Record<MeetingType, string> = {
@@ -60,17 +69,35 @@ const ACTION_STATUS_TONES: Record<DecisionActionStatus, 'nominal' | 'warning' | 
   cancelled: 'critical',
 };
 
-const createMeetingSchema = z.object({
+const requiredDateField = z.string().refine((val) => isValidIsoDate(val), {
+  message: 'Select a valid date (YYYY-MM-DD).',
+});
+
+const optionalDateField = z
+  .string()
+  .optional()
+  .refine((val) => !val || isValidIsoDate(val), {
+    message: 'Enter a valid date (YYYY-MM-DD).',
+  });
+
+const meetingBaseFields = {
   title: z.string().min(3, 'Enter a meeting title.'),
   meeting_type: z.enum(['executive', 'operational', 'product', 'client', 'all_hands']),
-  date: z.string().min(10, 'Select a date.'),
+  date: requiredDateField,
   start_time: z.string().min(4, 'Select start time.'),
   end_time: z.string().min(4, 'Select end time.'),
   business_unit_id: z.string().optional(),
   project_id: z.string().optional(),
   location_or_link: z.string().optional(),
   agenda: z.string().optional(),
-});
+};
+
+const createMeetingSchema = z
+  .object(meetingBaseFields)
+  .refine((vals) => vals.end_time > vals.start_time, {
+    message: 'End time must be after start time.',
+    path: ['end_time'],
+  });
 
 type CreateMeetingForm = z.infer<typeof createMeetingSchema>;
 
@@ -85,20 +112,70 @@ const createDecisionSchema = z.object({
 
 type CreateDecisionForm = z.infer<typeof createDecisionSchema>;
 
+const editMeetingSchema = z
+  .object({
+    ...meetingBaseFields,
+    status: z.enum(['scheduled', 'in_progress', 'completed', 'cancelled']),
+  })
+  .refine((vals) => vals.end_time > vals.start_time, {
+    message: 'End time must be after start time.',
+    path: ['end_time'],
+  });
+
+type EditMeetingForm = z.infer<typeof editMeetingSchema>;
+
+const editDecisionSchema = z.object({
+  title: z.string().min(3, 'Enter a decision title.'),
+  meeting_id: z.string().optional(),
+  business_unit_id: z.string().optional(),
+  context: z.string().min(5, 'Document the decision context.'),
+  outcome: z.string().min(5, 'Document the approved outcome or resolution.'),
+  status: z.enum(['proposed', 'approved', 'superseded', 'revoked']),
+});
+
+type EditDecisionForm = z.infer<typeof editDecisionSchema>;
+
+const editActionSchema = z.object({
+  title: z.string().min(2, 'Enter an action title.'),
+  owner_id: z.string().min(1, 'Select an owner.'),
+  due_date: optionalDateField,
+  status: z.enum(['open', 'in_progress', 'completed', 'cancelled']),
+});
+
+type EditActionForm = z.infer<typeof editActionSchema>;
+
 export function MeetingsPage() {
   const { profile: currentUser, companyId, hasPermission } = useAuth();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const initialTab = searchParams.get('tab') === 'decisions' ? 'decisions' : 'meetings';
+  const initialTab: ActiveTab =
+    searchParams.get('tab') === 'decisions'
+      ? 'decisions'
+      : searchParams.get('tab') === 'calendar'
+        ? 'calendar'
+        : 'meetings';
   const [activeTab, setActiveTab] = useState<ActiveTab>(initialTab);
   const [timeFilter, setTimeFilter] = useState<TimeFilter>('upcoming');
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(searchParams.get('meeting'));
+  const [calendarMonth, setCalendarMonth] = useState(() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth(), 1);
+  });
 
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
   const [decisionModalOpen, setDecisionModalOpen] = useState(false);
+  const [editingMeeting, setEditingMeeting] = useState<MeetingRecord | null>(null);
+  const [editingDecision, setEditingDecision] = useState<DecisionRecord | null>(null);
+  const [editingAction, setEditingAction] = useState<DecisionActionRecord | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { kind: 'meeting'; item: MeetingRecord }
+    | { kind: 'decision'; item: DecisionRecord }
+    | { kind: 'action'; item: DecisionActionRecord }
+    | null
+  >(null);
   const [selectedParticipantIds, setSelectedParticipantIds] = useState<string[]>([]);
   const [inviteProfileId, setInviteProfileId] = useState('');
   const [noteInput, setNoteInput] = useState('');
@@ -115,6 +192,8 @@ export function MeetingsPage() {
       setActiveTab('meetings');
     } else if (pTab === 'decisions') {
       setActiveTab('decisions');
+    } else if (pTab === 'calendar') {
+      setActiveTab('calendar');
     }
   }, [searchParams]);
 
@@ -234,12 +313,31 @@ export function MeetingsPage() {
     return { upcoming, completed, approvedDecisions, openActions };
   }, [meetings, decisions, decisionActions, nowIso]);
 
+  const todayIso = getLocalTodayIso();
+
+  const calendarDays = useMemo(() => {
+    const year = calendarMonth.getFullYear();
+    const month = calendarMonth.getMonth();
+    const firstDayOfWeek = new Date(year, month, 1).getDay();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const cells: Array<{ dateIso: string | null; dayNumber: number | null }> = [];
+    for (let i = 0; i < firstDayOfWeek; i++) cells.push({ dateIso: null, dayNumber: null });
+    for (let d = 1; d <= daysInMonth; d++) {
+      const iso = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      cells.push({ dateIso: iso, dayNumber: d });
+    }
+    while (cells.length % 7 !== 0) {
+      cells.push({ dateIso: null, dayNumber: null });
+    }
+    return cells;
+  }, [calendarMonth]);
+
   const meetingForm = useForm<CreateMeetingForm>({
     resolver: zodResolver(createMeetingSchema),
     defaultValues: {
       title: '',
       meeting_type: 'operational',
-      date: new Date().toISOString().slice(0, 10),
+      date: todayIso,
       start_time: '10:00',
       end_time: '11:00',
       business_unit_id: '',
@@ -260,6 +358,105 @@ export function MeetingsPage() {
       status: 'approved',
     },
   });
+
+  const editMeetingForm = useForm<EditMeetingForm>({
+    resolver: zodResolver(editMeetingSchema),
+    defaultValues: {
+      title: '',
+      meeting_type: 'operational',
+      date: todayIso,
+      start_time: '10:00',
+      end_time: '11:00',
+      business_unit_id: '',
+      project_id: '',
+      location_or_link: '',
+      agenda: '',
+      status: 'scheduled',
+    },
+  });
+
+  const editDecisionForm = useForm<EditDecisionForm>({
+    resolver: zodResolver(editDecisionSchema),
+    defaultValues: {
+      title: '',
+      meeting_id: '',
+      business_unit_id: '',
+      context: '',
+      outcome: '',
+      status: 'approved',
+    },
+  });
+
+  const editActionForm = useForm<EditActionForm>({
+    resolver: zodResolver(editActionSchema),
+    defaultValues: {
+      title: '',
+      owner_id: currentUser?.id ?? '',
+      due_date: '',
+      status: 'open',
+    },
+  });
+
+  const openEditMeetingModal = (mtg: MeetingRecord) => {
+    setActionError(null);
+    const startDt = new Date(mtg.scheduled_start);
+    const endDt = new Date(mtg.scheduled_end);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    editMeetingForm.reset({
+      title: mtg.title,
+      meeting_type: mtg.meeting_type,
+      date: `${startDt.getFullYear()}-${pad(startDt.getMonth() + 1)}-${pad(startDt.getDate())}`,
+      start_time: `${pad(startDt.getHours())}:${pad(startDt.getMinutes())}`,
+      end_time: `${pad(endDt.getHours())}:${pad(endDt.getMinutes())}`,
+      business_unit_id: mtg.business_unit_id ?? '',
+      project_id: mtg.project_id ?? '',
+      location_or_link: mtg.location_or_link ?? '',
+      agenda: mtg.agenda ?? '',
+      status: mtg.status,
+    });
+    setEditingMeeting(mtg);
+  };
+
+  const openEditDecisionModal = (dec: DecisionRecord) => {
+    setActionError(null);
+    editDecisionForm.reset({
+      title: dec.title,
+      meeting_id: dec.meeting_id ?? '',
+      business_unit_id: dec.business_unit_id ?? '',
+      context: dec.context,
+      outcome: dec.outcome,
+      status: dec.status,
+    });
+    setEditingDecision(dec);
+  };
+
+  const openScheduleModal = (prefillDate?: string) => {
+    setActionError(null);
+    setSelectedParticipantIds(currentUser ? [currentUser.id] : []);
+    meetingForm.reset({
+      title: '',
+      meeting_type: 'operational',
+      date: prefillDate ?? getLocalTodayIso(),
+      start_time: '10:00',
+      end_time: '11:00',
+      business_unit_id: '',
+      project_id: '',
+      location_or_link: '',
+      agenda: '',
+    });
+    setScheduleModalOpen(true);
+  };
+
+  const openEditActionModal = (act: DecisionActionRecord) => {
+    setActionError(null);
+    editActionForm.reset({
+      title: act.title,
+      owner_id: act.owner_id,
+      due_date: normalizeDateIso(act.due_date) ?? '',
+      status: act.status,
+    });
+    setEditingAction(act);
+  };
 
   const createMeetingMutation = useMutation({
     mutationFn: async (vals: CreateMeetingForm) => {
@@ -290,6 +487,55 @@ export function MeetingsPage() {
       await queryClient.invalidateQueries({ queryKey: ['ceo_metrics'] });
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to schedule meeting.'),
+  });
+
+  const updateMeetingMutation = useMutation({
+    mutationFn: async (vals: EditMeetingForm) => {
+      if (!currentUser || !companyId || !editingMeeting) throw new Error('Session unavailable.');
+      const startIso = new Date(`${vals.date}T${vals.start_time}:00`).toISOString();
+      const endIso = new Date(`${vals.date}T${vals.end_time}:00`).toISOString();
+      return erpRepository.updateMeeting(currentUser.id, companyId, {
+        id: editingMeeting.id,
+        title: vals.title,
+        meeting_type: vals.meeting_type,
+        scheduled_start: startIso,
+        scheduled_end: endIso,
+        business_unit_id: vals.business_unit_id || null,
+        project_id: vals.project_id || null,
+        location_or_link: vals.location_or_link || null,
+        agenda: vals.agenda || null,
+        status: vals.status,
+      });
+    },
+    onSuccess: async () => {
+      setActionError(null);
+      setEditingMeeting(null);
+      await queryClient.invalidateQueries({ queryKey: ['meetings'] });
+      await queryClient.invalidateQueries({ queryKey: ['ceo_metrics'] });
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update meeting.'),
+  });
+
+  const deleteMeetingMutation = useMutation({
+    mutationFn: async (meetingId: string) => {
+      if (!currentUser || !companyId) throw new Error('Session unavailable.');
+      await erpRepository.deleteMeeting(currentUser.id, companyId, meetingId);
+    },
+    onSuccess: async (_, meetingId) => {
+      setDeleteTarget(null);
+      if (selectedMeetingId === meetingId) {
+        setSelectedMeetingId(null);
+        setSearchParams({});
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['meetings'] }),
+        queryClient.invalidateQueries({ queryKey: ['meeting_participants'] }),
+        queryClient.invalidateQueries({ queryKey: ['decisions'] }),
+        queryClient.invalidateQueries({ queryKey: ['ceo_metrics'] }),
+      ]);
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete meeting.'),
   });
 
   const updateStatusMutation = useMutation({
@@ -382,6 +628,43 @@ export function MeetingsPage() {
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update decision.'),
   });
 
+  const updateDecisionMutation = useMutation({
+    mutationFn: async (vals: EditDecisionForm) => {
+      if (!currentUser || !companyId || !editingDecision) throw new Error('Session unavailable.');
+      return erpRepository.updateDecision(currentUser.id, companyId, {
+        id: editingDecision.id,
+        title: vals.title,
+        meeting_id: vals.meeting_id || null,
+        business_unit_id: vals.business_unit_id || null,
+        context: vals.context,
+        outcome: vals.outcome,
+        status: vals.status,
+      });
+    },
+    onSuccess: async () => {
+      setActionError(null);
+      setEditingDecision(null);
+      await queryClient.invalidateQueries({ queryKey: ['decisions'] });
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update decision.'),
+  });
+
+  const deleteDecisionMutation = useMutation({
+    mutationFn: async (decisionId: string) => {
+      if (!currentUser || !companyId) throw new Error('Session unavailable.');
+      await erpRepository.deleteDecision(currentUser.id, companyId, decisionId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['decisions'] }),
+        queryClient.invalidateQueries({ queryKey: ['decision_actions'] }),
+      ]);
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete decision.'),
+  });
+
   const createActionMutation = useMutation({
     mutationFn: async ({
       decisionId,
@@ -395,6 +678,9 @@ export function MeetingsPage() {
       dueDate: string;
     }) => {
       if (!currentUser || !companyId) throw new Error('Session unavailable.');
+      if (dueDate && !isValidIsoDate(dueDate)) {
+        throw new Error('Enter a valid due date (YYYY-MM-DD).');
+      }
       return erpRepository.createDecisionAction(currentUser.id, companyId, {
         decision_id: decisionId,
         title,
@@ -422,6 +708,38 @@ export function MeetingsPage() {
       await queryClient.invalidateQueries({ queryKey: ['decision_actions'] });
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update action item.'),
+  });
+
+  const updateActionMutation = useMutation({
+    mutationFn: async (vals: EditActionForm) => {
+      if (!currentUser || !companyId || !editingAction) throw new Error('Session unavailable.');
+      return erpRepository.updateDecisionAction(currentUser.id, companyId, {
+        id: editingAction.id,
+        title: vals.title,
+        owner_id: vals.owner_id,
+        due_date: vals.due_date || null,
+        status: vals.status,
+      });
+    },
+    onSuccess: async () => {
+      setActionError(null);
+      setEditingAction(null);
+      await queryClient.invalidateQueries({ queryKey: ['decision_actions'] });
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update action item.'),
+  });
+
+  const deleteActionMutation = useMutation({
+    mutationFn: async (actionId: string) => {
+      if (!currentUser || !companyId) throw new Error('Session unavailable.');
+      await erpRepository.deleteDecisionAction(currentUser.id, companyId, actionId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await queryClient.invalidateQueries({ queryKey: ['decision_actions'] });
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete action item.'),
   });
 
   const openDecisionModalForMeeting = (meetingId?: string) => {
@@ -460,10 +778,7 @@ export function MeetingsPage() {
             </button>
             <button
               type="button"
-              onClick={() => {
-                setSelectedParticipantIds(currentUser ? [currentUser.id] : []);
-                setScheduleModalOpen(true);
-              }}
+              onClick={() => openScheduleModal()}
               className="inline-flex h-9 items-center gap-1.5 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white hover:bg-[#082B4C] dark:bg-sky-600 dark:hover:bg-sky-500"
             >
               <Plus className="h-3.5 w-3.5" />
@@ -523,7 +838,7 @@ export function MeetingsPage() {
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-1 border-b border-slate-200 dark:border-[#1E3252]">
+      <div className="flex flex-wrap items-center gap-1 border-b border-slate-200 dark:border-[#1E3252]">
         <button
           type="button"
           onClick={() => {
@@ -537,6 +852,20 @@ export function MeetingsPage() {
           }`}
         >
           Schedule &amp; Meeting Workspace ({meetings.length})
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab('calendar');
+            setSearchParams({ tab: 'calendar' });
+          }}
+          className={`border-b-2 px-4 py-2.5 text-xs font-medium transition-colors ${
+            activeTab === 'calendar'
+              ? 'border-[#0B3B66] text-[#0B3B66] dark:border-sky-400 dark:text-sky-400'
+              : 'border-transparent text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200'
+          }`}
+        >
+          Calendar View
         </button>
         <button
           type="button"
@@ -608,33 +937,74 @@ export function MeetingsPage() {
                   const isSelected = selectedMeeting?.id === mtg.id;
                   const participantCount = allParticipants.filter((p) => p.meeting_id === mtg.id).length;
                   return (
-                    <button
+                    <div
                       key={mtg.id}
-                      type="button"
-                      onClick={() => setSelectedMeetingId(mtg.id)}
-                      className={`w-full px-4 py-3.5 text-left transition-colors ${
+                      className={`px-4 py-3.5 transition-colors ${
                         isSelected
                           ? 'bg-sky-50/70 dark:bg-[#102542]'
                           : 'hover:bg-slate-50 dark:hover:bg-[#102038]'
                       }`}
                     >
                       <div className="flex items-start justify-between gap-2">
-                        <span className="text-sm font-medium text-slate-900 dark:text-white">
-                          {mtg.title}
-                        </span>
-                        <StatusText
-                          tone={MEETING_STATUS_TONES[mtg.status]}
-                          label={mtg.status.replace('_', ' ')}
-                        />
+                        <button
+                          type="button"
+                          onClick={() => setSelectedMeetingId(mtg.id)}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <div className="text-sm font-medium text-slate-900 dark:text-white">
+                            {mtg.title}
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-3 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                            <span>{new Date(mtg.scheduled_start).toLocaleString()}</span>
+                            <span>·</span>
+                            <span className="font-sans">{MEETING_TYPE_LABELS[mtg.meeting_type]}</span>
+                            <span>·</span>
+                            <span className="font-sans">{participantCount} invited</span>
+                          </div>
+                        </button>
+                        <div className="flex shrink-0 flex-col items-end gap-1.5">
+                          <StatusText
+                            tone={MEETING_STATUS_TONES[mtg.status]}
+                            label={mtg.status.replace('_', ' ')}
+                          />
+                          {canManage ? (
+                            <div className="flex items-center gap-0.5">
+                              {mtg.status !== 'completed' ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateStatusMutation.mutate({
+                                      meetingId: mtg.id,
+                                      status: 'completed',
+                                    })
+                                  }
+                                  title="Mark meeting completed"
+                                  className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                >
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={() => openEditMeetingModal(mtg)}
+                                title="Edit meeting"
+                                className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteTarget({ kind: 'meeting', item: mtg })}
+                                title="Delete meeting"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
-                      <div className="mt-1 flex flex-wrap items-center gap-3 font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
-                        <span>{new Date(mtg.scheduled_start).toLocaleString()}</span>
-                        <span>·</span>
-                        <span className="font-sans">{MEETING_TYPE_LABELS[mtg.meeting_type]}</span>
-                        <span>·</span>
-                        <span className="font-sans">{participantCount} invited</span>
-                      </div>
-                    </button>
+                    </div>
                   );
                 })}
               </div>
@@ -690,22 +1060,56 @@ export function MeetingsPage() {
 
                   <div className="flex flex-wrap items-center gap-2">
                     {canManage ? (
-                      <select
-                        value={selectedMeeting.status}
-                        onChange={(e) =>
-                          updateStatusMutation.mutate({
-                            meetingId: selectedMeeting.id,
-                            status: e.target.value as MeetingStatus,
-                          })
-                        }
-                        aria-label="Meeting status"
-                        className="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
-                      >
-                        <option value="scheduled">Scheduled</option>
-                        <option value="in_progress">In Progress</option>
-                        <option value="completed">Completed</option>
-                        <option value="cancelled">Cancelled</option>
-                      </select>
+                      <>
+                        {selectedMeeting.status !== 'completed' ? (
+                          <button
+                            type="button"
+                            disabled={updateStatusMutation.isPending}
+                            onClick={() =>
+                              updateStatusMutation.mutate({
+                                meetingId: selectedMeeting.id,
+                                status: 'completed',
+                              })
+                            }
+                            className="inline-flex h-8 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
+                          >
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            Complete
+                          </button>
+                        ) : null}
+                        <select
+                          value={selectedMeeting.status}
+                          onChange={(e) =>
+                            updateStatusMutation.mutate({
+                              meetingId: selectedMeeting.id,
+                              status: e.target.value as MeetingStatus,
+                            })
+                          }
+                          aria-label="Meeting status"
+                          className="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                        >
+                          <option value="scheduled">Scheduled</option>
+                          <option value="in_progress">In Progress</option>
+                          <option value="completed">Completed</option>
+                          <option value="cancelled">Cancelled</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => openEditMeetingModal(selectedMeeting)}
+                          className="inline-flex h-8 items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeleteTarget({ kind: 'meeting', item: selectedMeeting })}
+                          className="inline-flex h-8 items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          Delete
+                        </button>
+                      </>
                     ) : (
                       <StatusText
                         tone={MEETING_STATUS_TONES[selectedMeeting.status]}
@@ -931,13 +1335,50 @@ export function MeetingsPage() {
                       {selectedMeetingDecisions.map((dec) => (
                         <li
                           key={dec.id}
-                          className="flex items-center justify-between rounded-md border border-slate-200 px-3 py-2 text-xs dark:border-[#1E3252]"
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 px-3 py-2 text-xs dark:border-[#1E3252]"
                         >
-                          <div>
+                          <div className="min-w-0 flex-1">
                             <div className="font-medium text-slate-900 dark:text-white">{dec.title}</div>
                             <div className="mt-0.5 text-slate-500 dark:text-slate-400">{dec.outcome}</div>
                           </div>
-                          <StatusText tone={DECISION_STATUS_TONES[dec.status]} label={dec.status} />
+                          <div className="flex items-center gap-1.5">
+                            <StatusText tone={DECISION_STATUS_TONES[dec.status]} label={dec.status} />
+                            {canManage ? (
+                              <>
+                                {dec.status !== 'approved' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateDecisionStatusMutation.mutate({
+                                        decisionId: dec.id,
+                                        status: 'approved',
+                                      })
+                                    }
+                                    title="Approve decision"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => openEditDecisionModal(dec)}
+                                  title="Edit decision"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'decision', item: dec })}
+                                  title="Delete decision"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
                         </li>
                       ))}
                     </ul>
@@ -947,8 +1388,141 @@ export function MeetingsPage() {
             )}
           </div>
         </div>
+      ) : activeTab === 'calendar' ? (
+        /* Tab 2: Monthly Meetings & Action Due-Date Calendar */
+        <section className="rounded-lg border border-slate-200 bg-white p-5 dark:border-[#1E3252] dark:bg-[#0C1729]">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                {calendarMonth.toLocaleString('en-US', { month: 'long', year: 'numeric' })}
+              </h2>
+              <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+                Scheduled meetings &amp; decision action due dates{canManage ? ' · Click + on any day to schedule a meeting' : ''}
+              </p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  const [y, m] = todayIso.split('-').map(Number);
+                  setCalendarMonth(new Date(y, m - 1, 1));
+                }}
+                className="inline-flex h-8 items-center rounded border border-slate-200 px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-200 dark:hover:bg-[#13233C]"
+              >
+                Today
+              </button>
+              <button
+                type="button"
+                onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))}
+                className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252] dark:hover:bg-[#13233C]"
+                aria-label="Previous month"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))}
+                className="inline-flex h-8 w-8 items-center justify-center rounded border border-slate-200 hover:bg-slate-50 dark:border-[#1E3252] dark:hover:bg-[#13233C]"
+                aria-label="Next month"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-7 gap-px overflow-hidden rounded border border-slate-200 bg-slate-200 dark:border-[#1E3252] dark:bg-[#1E3252]">
+            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => (
+              <div key={day} className="bg-slate-50 px-2 py-2 text-center text-[11px] font-semibold text-slate-600 dark:bg-[#091221] dark:text-slate-400">
+                {day}
+              </div>
+            ))}
+            {calendarDays.map((cell, idx) => {
+              const dayMeetings = cell.dateIso
+                ? meetings.filter((m) => getLocalTodayIso(new Date(m.scheduled_start)) === cell.dateIso)
+                : [];
+              const dayActions = cell.dateIso
+                ? decisionActions.filter((a) => normalizeDateIso(a.due_date) === cell.dateIso)
+                : [];
+              const isTodayCell = cell.dateIso === todayIso;
+              return (
+                <div
+                  key={idx}
+                  className={`group min-h-[104px] p-2 ${
+                    cell.dateIso
+                      ? isTodayCell
+                        ? 'bg-sky-50/60 dark:bg-[#10243E]'
+                        : 'bg-white dark:bg-[#0C1729]'
+                      : 'bg-slate-50/70 dark:bg-[#091221]'
+                  }`}
+                >
+                  {cell.dayNumber && cell.dateIso ? (
+                    <>
+                      <div className="flex items-center justify-between">
+                        <span
+                          className={`font-mono text-[11px] ${
+                            isTodayCell
+                              ? 'rounded bg-[#0B3B66] px-1.5 py-0.5 font-semibold text-white dark:bg-sky-600'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          {cell.dayNumber}
+                        </span>
+                        {canManage ? (
+                          <button
+                            type="button"
+                            onClick={() => openScheduleModal(cell.dateIso!)}
+                            title={`Schedule meeting on ${cell.dateIso}`}
+                            aria-label={`Schedule meeting on ${cell.dateIso}`}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded border border-transparent text-slate-400 opacity-70 hover:border-slate-200 hover:bg-slate-100 hover:text-slate-800 group-hover:opacity-100 dark:hover:border-[#1E3252] dark:hover:bg-[#13233C] dark:hover:text-white"
+                          >
+                            <Plus className="h-3 w-3" />
+                          </button>
+                        ) : null}
+                      </div>
+                      <div className="mt-1.5 space-y-1">
+                        {dayMeetings.map((mtg) => (
+                          <button
+                            key={mtg.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedMeetingId(mtg.id);
+                              setActiveTab('meetings');
+                              setSearchParams({ meeting: mtg.id });
+                            }}
+                            className={`block w-full truncate rounded border px-1.5 py-0.5 text-left text-[11px] font-medium ${
+                              mtg.status === 'cancelled'
+                                ? 'border-red-200 bg-red-50/70 text-red-700 line-through dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300'
+                                : mtg.status === 'completed'
+                                  ? 'border-emerald-200 bg-emerald-50/70 text-emerald-800 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300'
+                                  : 'border-slate-200 bg-slate-50 text-slate-800 hover:border-[#0B3B66] dark:border-[#1E3252] dark:bg-[#13233C] dark:text-slate-200'
+                            }`}
+                          >
+                            {new Date(mtg.scheduled_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · {mtg.title}
+                          </button>
+                        ))}
+                        {dayActions.map((act) => (
+                          <button
+                            key={`act-${act.id}`}
+                            type="button"
+                            onClick={() => {
+                              setActiveTab('decisions');
+                              setSearchParams({ tab: 'decisions' });
+                            }}
+                            className="block w-full truncate rounded border border-dashed border-amber-300 bg-amber-50/60 px-1.5 py-0.5 text-left text-[11px] text-amber-800 hover:border-amber-500 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-300"
+                          >
+                            Due: {act.title}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        </section>
       ) : (
-        /* Tab 2: Decision Register & Action Items */
+        /* Tab 3: Decision Register & Action Items */
         <div className="space-y-4">
           {decisions.length === 0 ? (
             <EmptyState
@@ -993,22 +1567,57 @@ export function MeetingsPage() {
                       </div>
 
                       {canManage ? (
-                        <select
-                          value={dec.status}
-                          onChange={(e) =>
-                            updateDecisionStatusMutation.mutate({
-                              decisionId: dec.id,
-                              status: e.target.value as DecisionStatus,
-                            })
-                          }
-                          aria-label={`Status for ${dec.title}`}
-                          className="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
-                        >
-                          <option value="proposed">Proposed</option>
-                          <option value="approved">Approved</option>
-                          <option value="superseded">Superseded</option>
-                          <option value="revoked">Revoked</option>
-                        </select>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {dec.status !== 'approved' ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateDecisionStatusMutation.mutate({
+                                  decisionId: dec.id,
+                                  status: 'approved',
+                                })
+                              }
+                              className="inline-flex h-8 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                              Approve
+                            </button>
+                          ) : null}
+                          <select
+                            value={dec.status}
+                            onChange={(e) =>
+                              updateDecisionStatusMutation.mutate({
+                                decisionId: dec.id,
+                                status: e.target.value as DecisionStatus,
+                              })
+                            }
+                            aria-label={`Status for ${dec.title}`}
+                            className="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                          >
+                            <option value="proposed">Proposed</option>
+                            <option value="approved">Approved</option>
+                            <option value="superseded">Superseded</option>
+                            <option value="revoked">Revoked</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => openEditDecisionModal(dec)}
+                            title="Edit decision"
+                            className="inline-flex h-8 items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteTarget({ kind: 'decision', item: dec })}
+                            title="Delete decision"
+                            className="inline-flex h-8 items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Delete
+                          </button>
+                        </div>
                       ) : null}
                     </div>
 
@@ -1047,21 +1656,54 @@ export function MeetingsPage() {
                                 ) : null}
                               </div>
                               {canManage ? (
-                                <select
-                                  value={act.status}
-                                  onChange={(e) =>
-                                    updateActionStatusMutation.mutate({
-                                      actionId: act.id,
-                                      status: e.target.value as DecisionActionStatus,
-                                    })
-                                  }
-                                  className="h-7 rounded border border-slate-200 bg-white px-2 text-[11px] text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
-                                >
-                                  <option value="open">Open</option>
-                                  <option value="in_progress">In Progress</option>
-                                  <option value="completed">Completed</option>
-                                  <option value="cancelled">Cancelled</option>
-                                </select>
+                                <div className="flex items-center gap-1.5">
+                                  {act.status !== 'completed' ? (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateActionStatusMutation.mutate({
+                                          actionId: act.id,
+                                          status: 'completed',
+                                        })
+                                      }
+                                      title="Mark action completed"
+                                      className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  ) : null}
+                                  <select
+                                    value={act.status}
+                                    onChange={(e) =>
+                                      updateActionStatusMutation.mutate({
+                                        actionId: act.id,
+                                        status: e.target.value as DecisionActionStatus,
+                                      })
+                                    }
+                                    className="h-7 rounded border border-slate-200 bg-white px-2 text-[11px] text-slate-800 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                                  >
+                                    <option value="open">Open</option>
+                                    <option value="in_progress">In Progress</option>
+                                    <option value="completed">Completed</option>
+                                    <option value="cancelled">Cancelled</option>
+                                  </select>
+                                  <button
+                                    type="button"
+                                    onClick={() => openEditActionModal(act)}
+                                    title="Edit action item"
+                                    className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                  >
+                                    <Pencil className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeleteTarget({ kind: 'action', item: act })}
+                                    title="Delete action item"
+                                    className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
                               ) : (
                                 <StatusText
                                   tone={ACTION_STATUS_TONES[act.status]}
@@ -1196,6 +1838,9 @@ export function MeetingsPage() {
                     {...meetingForm.register('date')}
                     className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
                   />
+                  {meetingForm.formState.errors.date ? (
+                    <p className="mt-1 text-[11px] text-red-600">{meetingForm.formState.errors.date.message}</p>
+                  ) : null}
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
@@ -1214,6 +1859,9 @@ export function MeetingsPage() {
                       className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
                     />
                   </div>
+                  {meetingForm.formState.errors.end_time ? (
+                    <p className="col-span-2 text-[11px] text-red-600">{meetingForm.formState.errors.end_time.message}</p>
+                  ) : null}
                 </div>
               </div>
 
@@ -1453,6 +2101,408 @@ export function MeetingsPage() {
           </div>
         </div>
       ) : null}
+
+      {/* Edit Meeting Modal */}
+      {editingMeeting ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Meeting
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingMeeting(null)}
+                className="rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={editMeetingForm.handleSubmit((vals) => updateMeetingMutation.mutate(vals))}
+              className="mt-4 space-y-4 text-xs"
+            >
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                  Meeting Title
+                </label>
+                <input
+                  {...editMeetingForm.register('title')}
+                  className="h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Type</label>
+                  <select
+                    {...editMeetingForm.register('meeting_type')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    {(Object.keys(MEETING_TYPE_LABELS) as MeetingType[]).map((mt) => (
+                      <option key={mt} value={mt}>
+                        {MEETING_TYPE_LABELS[mt]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                  <select
+                    {...editMeetingForm.register('status')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="scheduled">Scheduled</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Date</label>
+                  <input
+                    type="date"
+                    {...editMeetingForm.register('date')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  />
+                  {editMeetingForm.formState.errors.date ? (
+                    <p className="mt-1 text-[11px] text-red-600">{editMeetingForm.formState.errors.date.message}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Start</label>
+                  <input
+                    type="time"
+                    {...editMeetingForm.register('start_time')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">End</label>
+                  <input
+                    type="time"
+                    {...editMeetingForm.register('end_time')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  />
+                </div>
+                {editMeetingForm.formState.errors.end_time ? (
+                  <p className="text-[11px] text-red-600 sm:col-span-3">{editMeetingForm.formState.errors.end_time.message}</p>
+                ) : null}
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                    Business Unit
+                  </label>
+                  <select
+                    {...editMeetingForm.register('business_unit_id')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="">Company-Wide</option>
+                    {businessUnits.map((bu) => (
+                      <option key={bu.id} value={bu.id}>
+                        {bu.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                    Project
+                  </label>
+                  <select
+                    {...editMeetingForm.register('project_id')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="">None</option>
+                    {projects.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.code} · {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                  Location or Video Link
+                </label>
+                <input
+                  {...editMeetingForm.register('location_or_link')}
+                  className="h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Agenda</label>
+                <textarea
+                  rows={3}
+                  {...editMeetingForm.register('agenda')}
+                  className="w-full rounded-md border border-slate-200 bg-white p-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingMeeting(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateMeetingMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 font-medium text-white hover:bg-[#082B4C] disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                >
+                  {updateMeetingMutation.isPending ? 'Saving...' : 'Save Meeting'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Edit Decision Modal */}
+      {editingDecision ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Official Decision
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingDecision(null)}
+                className="rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form
+              onSubmit={editDecisionForm.handleSubmit((vals) => updateDecisionMutation.mutate(vals))}
+              className="mt-4 space-y-4 text-xs"
+            >
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                  Decision Title
+                </label>
+                <input
+                  {...editDecisionForm.register('title')}
+                  className="h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                    Linked Meeting
+                  </label>
+                  <select
+                    {...editDecisionForm.register('meeting_id')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="">Standalone Decision</option>
+                    {meetings.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                    Business Unit
+                  </label>
+                  <select
+                    {...editDecisionForm.register('business_unit_id')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="">Company-Wide</option>
+                    {businessUnits.map((bu) => (
+                      <option key={bu.id} value={bu.id}>
+                        {bu.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                  <select
+                    {...editDecisionForm.register('status')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="proposed">Proposed</option>
+                    <option value="approved">Approved</option>
+                    <option value="superseded">Superseded</option>
+                    <option value="revoked">Revoked</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Context</label>
+                <textarea
+                  rows={2}
+                  {...editDecisionForm.register('context')}
+                  className="w-full rounded-md border border-slate-200 bg-white p-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">
+                  Outcome &amp; Resolution
+                </label>
+                <textarea
+                  rows={2}
+                  {...editDecisionForm.register('outcome')}
+                  className="w-full rounded-md border border-slate-200 bg-white p-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingDecision(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateDecisionMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 font-medium text-white hover:bg-[#082B4C] disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                >
+                  {updateDecisionMutation.isPending ? 'Saving...' : 'Save Decision'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Edit Action Item Modal */}
+      {editingAction ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
+              <h2 className="font-display text-base font-semibold text-slate-900 dark:text-white">
+                Edit Action Item
+              </h2>
+              <button
+                type="button"
+                onClick={() => setEditingAction(null)}
+                className="rounded p-1 text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <form
+              onSubmit={editActionForm.handleSubmit((vals) => updateActionMutation.mutate(vals))}
+              className="mt-4 space-y-4 text-xs"
+            >
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Action Title</label>
+                <input
+                  {...editActionForm.register('title')}
+                  className="h-9 w-full rounded-md border border-slate-200 bg-white px-3 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Owner</label>
+                <select
+                  {...editActionForm.register('owner_id')}
+                  className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                >
+                  {teamMembers.map((m) => (
+                    <option key={m.id} value={m.id}>{m.full_name}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Due Date</label>
+                  <input
+                    type="date"
+                    {...editActionForm.register('due_date')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 font-mono text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  />
+                  {editActionForm.formState.errors.due_date ? (
+                    <p className="mt-1 text-[11px] text-red-600">{editActionForm.formState.errors.due_date.message}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className="mb-1 block font-medium text-slate-700 dark:text-slate-300">Status</label>
+                  <select
+                    {...editActionForm.register('status')}
+                    className="h-9 w-full rounded-md border border-slate-200 bg-white px-2.5 text-slate-900 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-100"
+                  >
+                    <option value="open">Open</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="completed">Completed</option>
+                    <option value="cancelled">Cancelled</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => setEditingAction(null)}
+                  className="h-9 rounded-md border border-slate-200 px-4 font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:text-slate-300 dark:hover:bg-[#13233C]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={updateActionMutation.isPending}
+                  className="h-9 rounded-md bg-[#0B3B66] px-4 font-medium text-white hover:bg-[#082B4C] disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                >
+                  {updateActionMutation.isPending ? 'Saving...' : 'Save Action'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title={
+          deleteTarget?.kind === 'meeting'
+            ? 'Delete Meeting'
+            : deleteTarget?.kind === 'decision'
+              ? 'Delete Decision'
+              : 'Delete Action Item'
+        }
+        description={
+          deleteTarget?.kind === 'meeting'
+            ? `Permanently delete meeting "${deleteTarget.item.title}" along with its participants and notes?`
+            : deleteTarget?.kind === 'decision'
+              ? `Permanently delete decision "${deleteTarget.item.title}" and its follow-up action items?`
+              : deleteTarget?.kind === 'action'
+                ? `Permanently delete action item "${deleteTarget.item.title}"?`
+                : ''
+        }
+        isPending={
+          deleteMeetingMutation.isPending ||
+          deleteDecisionMutation.isPending ||
+          deleteActionMutation.isPending
+        }
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          if (deleteTarget.kind === 'meeting') deleteMeetingMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'decision') deleteDecisionMutation.mutate(deleteTarget.item.id);
+          else deleteActionMutation.mutate(deleteTarget.item.id);
+        }}
+      />
     </div>
   );
 }

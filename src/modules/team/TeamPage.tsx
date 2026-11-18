@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Search,
   ShieldAlert,
+  Trash2,
   UserPlus,
   Users,
   X,
@@ -29,6 +30,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { generateRandomNumberPassword } from '../../lib/authCredentials';
 import { erpRepository } from '../../services/erpRepository';
 import type { Department, EmploymentType, MemberStatus, ResourceMembership, TeamMemberRecord } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -100,6 +102,7 @@ export function TeamPage() {
   const [editMemberOpen, setEditMemberOpen] = useState(false);
   const [deptModalOpen, setDeptModalOpen] = useState(false);
   const [editingDept, setEditingDept] = useState<Department | null>(null);
+  const [deletingDept, setDeletingDept] = useState<Department | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [showCreatePassword, setShowCreatePassword] = useState(true);
@@ -429,6 +432,24 @@ export function TeamPage() {
     },
     onError: (err) => {
       setActionError(err instanceof Error ? err.message : 'Unable to save department.');
+    },
+  });
+
+  const deleteDeptMutation = useMutation({
+    mutationFn: async (deptId: string) => {
+      if (!currentUser || !companyId) throw new Error('No authenticated actor.');
+      await erpRepository.deleteDepartment(currentUser.id, companyId, deptId);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['departments'] });
+      await queryClient.invalidateQueries({ queryKey: ['team_members'] });
+      setDeletingDept(null);
+      setActionError(null);
+      setActionSuccess('Department deleted.');
+    },
+    onError: (err) => {
+      setDeletingDept(null);
+      setActionError(err instanceof Error ? err.message : 'Unable to delete department.');
     },
   });
 
@@ -1200,13 +1221,23 @@ export function TeamPage() {
                         </td>
                         {canManageTeam ? (
                           <td className="px-5 py-3 text-right">
-                            <button
-                              type="button"
-                              onClick={() => openEditDept(dept)}
-                              className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
-                            >
-                              Edit
-                            </button>
+                            <div className="inline-flex items-center gap-3">
+                              <button
+                                type="button"
+                                onClick={() => openEditDept(dept)}
+                                className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeletingDept(dept)}
+                                className="inline-flex items-center gap-1 text-xs font-medium text-red-700 hover:underline dark:text-red-400"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                                Delete
+                              </button>
+                            </div>
                           </td>
                         ) : null}
                       </tr>
@@ -1801,6 +1832,21 @@ export function TeamPage() {
           </div>
         </div>
       ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deletingDept)}
+        title="Delete Department"
+        description={
+          deletingDept
+            ? `Permanently delete the "${deletingDept.name}" department? Assigned team members will remain active with no department assigned.`
+            : ''
+        }
+        isPending={deleteDeptMutation.isPending}
+        onCancel={() => setDeletingDept(null)}
+        onConfirm={() => {
+          if (deletingDept) deleteDeptMutation.mutate(deletingDept.id);
+        }}
+      />
     </div>
   );
 }

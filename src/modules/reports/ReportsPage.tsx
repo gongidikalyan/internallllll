@@ -14,6 +14,7 @@ import {
 import { useAuth } from '../../contexts/AuthContext';
 import { formatMinorCurrency } from '../../lib/currency';
 import { downloadCsvReport, minorToDecimalString } from '../../lib/csv';
+import { addDaysIso, getLocalTodayIso } from '../../lib/date';
 import { BUSINESS_UNIT_LABELS } from '../../lib/navigation';
 import { erpRepository } from '../../services/erpRepository';
 import { StatusText } from '../../components/ui/StatusText';
@@ -33,15 +34,9 @@ const PIPELINE_ORDER: LeadStage[] = [
   'lost',
 ];
 
-function subtractDaysIso(days: number): string {
-  const dt = new Date();
-  dt.setDate(dt.getDate() - days);
-  return dt.toISOString().slice(0, 10);
-}
-
 export function ReportsPage() {
   const { companyId } = useAuth();
-  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayIso = getLocalTodayIso();
 
   const [activeTab, setActiveTab] = useState<ReportTab>('executive');
   const [datePreset, setDatePreset] = useState<DatePreset>('all');
@@ -49,8 +44,8 @@ export function ReportsPage() {
   const [customEnd, setCustomEnd] = useState(todayIso);
 
   const rangeBounds = useMemo(() => {
-    if (datePreset === '30d') return { start: subtractDaysIso(30), end: todayIso };
-    if (datePreset === '90d') return { start: subtractDaysIso(90), end: todayIso };
+    if (datePreset === '30d') return { start: addDaysIso(todayIso, -30), end: todayIso };
+    if (datePreset === '90d') return { start: addDaysIso(todayIso, -90), end: todayIso };
     if (datePreset === 'ytd') return { start: `${todayIso.slice(0, 4)}-01-01`, end: todayIso };
     if (datePreset === 'custom') return { start: customStart, end: customEnd };
     return { start: '', end: '' };

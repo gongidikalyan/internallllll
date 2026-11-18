@@ -15,15 +15,18 @@ import {
   FolderKanban,
   Handshake,
   MessageSquare,
+  Pencil,
   Plus,
   Search,
   ShieldAlert,
   Table2,
+  Trash2,
   UserPlus,
   X,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { formatMinorCurrency } from '../../lib/currency';
+import { getLocalTodayIso } from '../../lib/date';
 import { erpRepository } from '../../services/erpRepository';
 import type {
   ClientRecord,
@@ -36,6 +39,7 @@ import type {
   ProposalRecord,
   ProposalStatus,
 } from '../../types/erp';
+import { ConfirmDeleteDialog } from '../../components/ui/ConfirmDeleteDialog';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { StatusText } from '../../components/ui/StatusText';
 
@@ -168,6 +172,17 @@ export function ClientServicesPage() {
   const [clientModalOpen, setClientModalOpen] = useState(false);
   const [proposalModalOpen, setProposalModalOpen] = useState(false);
   const [contractModalOpen, setContractModalOpen] = useState(false);
+  const [editingLead, setEditingLead] = useState<LeadRecord | null>(null);
+  const [editingClient, setEditingClient] = useState<ClientRecord | null>(null);
+  const [editingProposal, setEditingProposal] = useState<ProposalRecord | null>(null);
+  const [editingContract, setEditingContract] = useState<ContractRecord | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<
+    | { kind: 'lead'; item: LeadRecord }
+    | { kind: 'client'; item: ClientRecord }
+    | { kind: 'proposal'; item: ProposalRecord }
+    | { kind: 'contract'; item: ContractRecord }
+    | null
+  >(null);
   const [clientProjectModalClient, setClientProjectModalClient] = useState<ClientRecord | null>(null);
 
   const [actionError, setActionError] = useState<string | null>(null);
@@ -386,7 +401,7 @@ export function ClientServicesPage() {
       proposal_id: '',
       contract_value_major: '',
       currency_code: defaultCurrency,
-      start_date: new Date().toISOString().slice(0, 10),
+      start_date: getLocalTodayIso(),
       end_date: '',
       status: 'draft',
     },
@@ -406,12 +421,11 @@ export function ClientServicesPage() {
     ]);
   };
 
-  const createLeadMutation = useMutation({
+  const saveLeadFormMutation = useMutation({
     mutationFn: async (vals: CreateLeadForm) => {
       if (!currentUser || !companyId) throw new Error('No active session.');
       const currency = vals.currency_code.toUpperCase();
-      return erpRepository.createLead(currentUser.id, companyId, {
-        business_unit_id: csUnit?.id ?? null,
+      const payload = {
         organization_name: vals.organization_name,
         contact_name: vals.contact_name,
         contact_email: vals.contact_email || null,
@@ -423,16 +437,27 @@ export function ClientServicesPage() {
         owner_id: vals.owner_id || currentUser.id,
         next_follow_up_at: vals.next_follow_up_at ? new Date(vals.next_follow_up_at).toISOString() : null,
         requirements_summary: vals.requirements_summary || null,
+      };
+      if (editingLead) {
+        return erpRepository.updateLead(currentUser.id, companyId, {
+          id: editingLead.id,
+          ...payload,
+        });
+      }
+      return erpRepository.createLead(currentUser.id, companyId, {
+        business_unit_id: csUnit?.id ?? null,
+        ...payload,
       });
     },
-    onSuccess: async (created) => {
+    onSuccess: async (saved) => {
       await invalidateAll();
       setLeadModalOpen(false);
+      setEditingLead(null);
       leadForm.reset();
-      setSelectedLeadId(created.id);
+      setSelectedLeadId(saved.id);
       setActionError(null);
     },
-    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to create lead.'),
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to save lead.'),
   });
 
   const updateLeadMutation = useMutation({
@@ -445,6 +470,20 @@ export function ClientServicesPage() {
       setActionError(null);
     },
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to update lead.'),
+  });
+
+  const deleteLeadMutation = useMutation({
+    mutationFn: async (leadId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteLead(currentUser.id, companyId, leadId);
+    },
+    onSuccess: async (_, leadId) => {
+      setDeleteTarget(null);
+      if (selectedLeadId === leadId) setSelectedLeadId(null);
+      await invalidateAll();
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete lead.'),
   });
 
   const convertLeadMutation = useMutation({
@@ -462,10 +501,10 @@ export function ClientServicesPage() {
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to convert lead to client.'),
   });
 
-  const createClientMutation = useMutation({
+  const saveClientFormMutation = useMutation({
     mutationFn: async (vals: CreateClientForm) => {
       if (!currentUser || !companyId) throw new Error('No active session.');
-      return erpRepository.createClient(currentUser.id, companyId, {
+      const payload = {
         business_unit_id: csUnit?.id ?? null,
         name: vals.name,
         industry: vals.industry || null,
@@ -473,16 +512,38 @@ export function ClientServicesPage() {
         billing_address: vals.billing_address || null,
         account_owner_id: vals.account_owner_id || currentUser.id,
         status: vals.status,
-      });
+      };
+      if (editingClient) {
+        return erpRepository.updateClient(currentUser.id, companyId, {
+          id: editingClient.id,
+          ...payload,
+        });
+      }
+      return erpRepository.createClient(currentUser.id, companyId, payload);
     },
-    onSuccess: async (created) => {
+    onSuccess: async (saved) => {
       await invalidateAll();
       setClientModalOpen(false);
+      setEditingClient(null);
       clientForm.reset();
-      setSelectedClientId(created.id);
+      setSelectedClientId(saved.id);
       setActionError(null);
     },
-    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to create client.'),
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to save client.'),
+  });
+
+  const deleteClientMutation = useMutation({
+    mutationFn: async (clientId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteClient(currentUser.id, companyId, clientId);
+    },
+    onSuccess: async (_, clientId) => {
+      setDeleteTarget(null);
+      if (selectedClientId === clientId) setSelectedClientId(null);
+      await invalidateAll();
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete client.'),
   });
 
   const updateClientStatusMutation = useMutation({
@@ -539,12 +600,12 @@ export function ClientServicesPage() {
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to log communication.'),
   });
 
-  const createProposalMutation = useMutation({
+  const saveProposalFormMutation = useMutation({
     mutationFn: async (vals: CreateProposalForm) => {
       if (!currentUser || !companyId) throw new Error('No active session.');
       const currency = vals.currency_code.toUpperCase();
       const estHours = vals.estimated_hours ? Number(vals.estimated_hours) : null;
-      return erpRepository.createProposal(currentUser.id, companyId, {
+      const payload = {
         lead_id: vals.lead_id || null,
         client_id: vals.client_id || null,
         proposal_number: vals.proposal_number,
@@ -554,15 +615,36 @@ export function ClientServicesPage() {
         proposed_amount_minor: majorToMinor(vals.proposed_amount_major, currency),
         currency_code: currency,
         valid_until: vals.valid_until || null,
-      });
+      };
+      if (editingProposal) {
+        return erpRepository.updateProposal(currentUser.id, companyId, {
+          id: editingProposal.id,
+          ...payload,
+        });
+      }
+      return erpRepository.createProposal(currentUser.id, companyId, payload);
     },
     onSuccess: async () => {
       await invalidateAll();
       setProposalModalOpen(false);
+      setEditingProposal(null);
       proposalForm.reset();
       setActionError(null);
     },
-    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to create proposal.'),
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to save proposal.'),
+  });
+
+  const deleteProposalMutation = useMutation({
+    mutationFn: async (proposalId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteProposal(currentUser.id, companyId, proposalId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateAll();
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete proposal.'),
   });
 
   const proposalWorkflowMutation = useMutation({
@@ -591,11 +673,11 @@ export function ClientServicesPage() {
     onError: (err) => setActionError(err instanceof Error ? err.message : 'Proposal action failed.'),
   });
 
-  const createContractMutation = useMutation({
+  const saveContractFormMutation = useMutation({
     mutationFn: async (vals: CreateContractForm) => {
       if (!currentUser || !companyId) throw new Error('No active session.');
       const currency = vals.currency_code.toUpperCase();
-      return erpRepository.createContract(currentUser.id, companyId, {
+      const payload = {
         client_id: vals.client_id,
         proposal_id: vals.proposal_id || null,
         contract_number: vals.contract_number,
@@ -605,15 +687,36 @@ export function ClientServicesPage() {
         start_date: vals.start_date,
         end_date: vals.end_date || null,
         status: vals.status,
-      });
+      };
+      if (editingContract) {
+        return erpRepository.updateContract(currentUser.id, companyId, {
+          id: editingContract.id,
+          ...payload,
+        });
+      }
+      return erpRepository.createContract(currentUser.id, companyId, payload);
     },
     onSuccess: async () => {
       await invalidateAll();
       setContractModalOpen(false);
+      setEditingContract(null);
       contractForm.reset();
       setActionError(null);
     },
-    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to create contract.'),
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to save contract.'),
+  });
+
+  const deleteContractMutation = useMutation({
+    mutationFn: async (contractId: string) => {
+      if (!currentUser || !companyId) throw new Error('No active session.');
+      await erpRepository.deleteContract(currentUser.id, companyId, contractId);
+    },
+    onSuccess: async () => {
+      setDeleteTarget(null);
+      await invalidateAll();
+      setActionError(null);
+    },
+    onError: (err) => setActionError(err instanceof Error ? err.message : 'Unable to delete contract.'),
   });
 
   const updateContractStatusMutation = useMutation({
@@ -642,7 +745,7 @@ export function ClientServicesPage() {
         status: 'active',
         owner_id: clientProjectModalClient.account_owner_id ?? currentUser.id,
         project_manager_id: cpManagerId || currentUser.id,
-        start_date: new Date().toISOString().slice(0, 10),
+        start_date: getLocalTodayIso(),
         due_date: cpDueDate || null,
         budget_minor: majorToMinor(cpBudgetMajor, defaultCurrency),
         budget_currency: defaultCurrency,
@@ -671,8 +774,42 @@ export function ClientServicesPage() {
     setClientProjectModalClient(client);
   };
 
+  const openEditLeadModal = (lead: LeadRecord) => {
+    setActionError(null);
+    setEditingLead(lead);
+    leadForm.reset({
+      organization_name: lead.organization_name,
+      contact_name: lead.contact_name,
+      contact_email: lead.contact_email ?? '',
+      contact_phone: lead.contact_phone ?? '',
+      source: lead.source ?? '',
+      stage: lead.stage,
+      estimated_value_major: minorToMajorString(lead.estimated_value_minor, lead.currency_code),
+      currency_code: lead.currency_code,
+      owner_id: lead.owner_id ?? '',
+      next_follow_up_at: lead.next_follow_up_at ? lead.next_follow_up_at.slice(0, 16) : '',
+      requirements_summary: lead.requirements_summary ?? '',
+    });
+    setLeadModalOpen(true);
+  };
+
+  const openEditClientModal = (client: ClientRecord) => {
+    setActionError(null);
+    setEditingClient(client);
+    clientForm.reset({
+      name: client.name,
+      industry: client.industry ?? '',
+      website: client.website ?? '',
+      billing_address: client.billing_address ?? '',
+      account_owner_id: client.account_owner_id ?? '',
+      status: client.status,
+    });
+    setClientModalOpen(true);
+  };
+
   const openProposalModal = (prefillLead?: LeadRecord) => {
     setActionError(null);
+    setEditingProposal(null);
     proposalForm.reset({
       proposal_number: `PROP-${String(proposals.length + 1).padStart(3, '0')}`,
       title: prefillLead ? `${prefillLead.organization_name} Implementation Proposal` : '',
@@ -689,8 +826,26 @@ export function ClientServicesPage() {
     setProposalModalOpen(true);
   };
 
+  const openEditProposalModal = (prop: ProposalRecord) => {
+    setActionError(null);
+    setEditingProposal(prop);
+    proposalForm.reset({
+      proposal_number: prop.proposal_number,
+      title: prop.title,
+      lead_id: prop.lead_id ?? '',
+      client_id: prop.client_id ?? '',
+      scope_summary: prop.scope_summary,
+      estimated_hours: prop.estimated_hours !== null ? String(prop.estimated_hours) : '',
+      proposed_amount_major: minorToMajorString(prop.proposed_amount_minor, prop.currency_code),
+      currency_code: prop.currency_code,
+      valid_until: prop.valid_until ?? '',
+    });
+    setProposalModalOpen(true);
+  };
+
   const openContractModal = (prefillProposal?: ProposalRecord) => {
     setActionError(null);
+    setEditingContract(null);
     contractForm.reset({
       contract_number: `CTR-${String(contracts.length + 1).padStart(3, '0')}`,
       title: prefillProposal?.title ?? '',
@@ -700,9 +855,26 @@ export function ClientServicesPage() {
         ? minorToMajorString(prefillProposal.proposed_amount_minor, prefillProposal.currency_code)
         : '',
       currency_code: prefillProposal?.currency_code ?? defaultCurrency,
-      start_date: new Date().toISOString().slice(0, 10),
+      start_date: getLocalTodayIso(),
       end_date: '',
       status: 'draft',
+    });
+    setContractModalOpen(true);
+  };
+
+  const openEditContractModal = (ctr: ContractRecord) => {
+    setActionError(null);
+    setEditingContract(ctr);
+    contractForm.reset({
+      contract_number: ctr.contract_number,
+      title: ctr.title,
+      client_id: ctr.client_id,
+      proposal_id: ctr.proposal_id ?? '',
+      contract_value_major: minorToMajorString(ctr.contract_value_minor, ctr.currency_code),
+      currency_code: ctr.currency_code,
+      start_date: ctr.start_date,
+      end_date: ctr.end_date ?? '',
+      status: ctr.status,
     });
     setContractModalOpen(true);
   };
@@ -732,6 +904,7 @@ export function ClientServicesPage() {
                 type="button"
                 onClick={() => {
                   setActionError(null);
+                  setEditingLead(null);
                   leadForm.reset({
                     organization_name: '',
                     contact_name: '',
@@ -966,6 +1139,37 @@ export function ClientServicesPage() {
                               ) : null}
                             </div>
                           </button>
+                          {canManagePipeline ? (
+                            <div className="mt-2.5 flex items-center justify-end gap-1 border-t border-slate-100 pt-2 dark:border-[#1E3252]">
+                              {lead.stage !== 'won' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => updateLeadMutation.mutate({ id: lead.id, stage: 'won' })}
+                                  title="Mark lead won"
+                                  className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                >
+                                  <CheckCircle2 className="h-3 w-3" />
+                                  Won
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={() => openEditLeadModal(lead)}
+                                title="Edit lead"
+                                className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                              >
+                                <Pencil className="h-3 w-3" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setDeleteTarget({ kind: 'lead', item: lead })}
+                                title="Delete lead"
+                                className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </div>
+                          ) : null}
                         </div>
                       ))}
                     </div>
@@ -998,6 +1202,7 @@ export function ClientServicesPage() {
                         <th className="px-4 py-3">Owner</th>
                         <th className="px-4 py-3">Next Follow-Up</th>
                         <th className="px-4 py-3 text-right">Est. Value</th>
+                        {canManagePipeline ? <th className="px-4 py-3 text-right">Actions</th> : null}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1026,6 +1231,38 @@ export function ClientServicesPage() {
                           <td className="px-4 py-3 text-right font-mono font-semibold tabular-nums text-slate-900 dark:text-white">
                             {formatMinorCurrency(l.estimated_value_minor, l.currency_code)}
                           </td>
+                          {canManagePipeline ? (
+                            <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                              <div className="inline-flex items-center justify-end gap-1">
+                                {l.stage !== 'won' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => updateLeadMutation.mutate({ id: l.id, stage: 'won' })}
+                                    title="Mark lead won"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => openEditLeadModal(l)}
+                                  title="Edit lead"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'lead', item: l })}
+                                  title="Delete lead"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </td>
+                          ) : null}
                         </tr>
                       ))}
                     </tbody>
@@ -1087,26 +1324,59 @@ export function ClientServicesPage() {
                   ) : null}
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-2">
                   <span className="text-xs text-slate-500 dark:text-slate-400">
                     Owner: {selectedClient.account_owner_id ? memberMap.get(selectedClient.account_owner_id) ?? '—' : 'Unassigned'}
                   </span>
                   {canManagePipeline ? (
-                    <select
-                      value={selectedClient.status}
-                      onChange={(e) =>
-                        updateClientStatusMutation.mutate({
-                          id: selectedClient.id,
-                          status: e.target.value as ClientStatus,
-                        })
-                      }
-                      className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]"
-                    >
-                      <option value="prospect">Prospect</option>
-                      <option value="active">Active</option>
-                      <option value="inactive">Inactive</option>
-                      <option value="churned">Churned</option>
-                    </select>
+                    <>
+                      {selectedClient.status !== 'active' ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateClientStatusMutation.mutate({
+                              id: selectedClient.id,
+                              status: 'active',
+                            })
+                          }
+                          className="inline-flex h-8 items-center gap-1 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
+                        >
+                          <CheckCircle2 className="h-3.5 w-3.5" />
+                          Activate
+                        </button>
+                      ) : null}
+                      <select
+                        value={selectedClient.status}
+                        onChange={(e) =>
+                          updateClientStatusMutation.mutate({
+                            id: selectedClient.id,
+                            status: e.target.value as ClientStatus,
+                          })
+                        }
+                        className="h-8 rounded border border-slate-200 bg-white px-2.5 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]"
+                      >
+                        <option value="prospect">Prospect</option>
+                        <option value="active">Active</option>
+                        <option value="inactive">Inactive</option>
+                        <option value="churned">Churned</option>
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => openEditClientModal(selectedClient)}
+                        className="inline-flex h-8 items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDeleteTarget({ kind: 'client', item: selectedClient })}
+                        className="inline-flex h-8 items-center gap-1 rounded-md border border-red-200 bg-white px-2.5 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Delete
+                      </button>
+                    </>
                   ) : (
                     <StatusText
                       tone={selectedClient.status === 'active' ? 'nominal' : selectedClient.status === 'churned' ? 'critical' : 'neutral'}
@@ -1281,6 +1551,7 @@ export function ClientServicesPage() {
                   type="button"
                   onClick={() => {
                     setActionError(null);
+                    setEditingClient(null);
                     clientForm.reset({
                       name: '',
                       industry: '',
@@ -1316,6 +1587,7 @@ export function ClientServicesPage() {
                         <th className="px-4 py-3">Account Owner</th>
                         <th className="px-4 py-3">Projects</th>
                         <th className="px-4 py-3">Status</th>
+                        {canManagePipeline ? <th className="px-4 py-3 text-right">Actions</th> : null}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-[#1E3252]">
@@ -1341,6 +1613,40 @@ export function ClientServicesPage() {
                                 label={c.status}
                               />
                             </td>
+                            {canManagePipeline ? (
+                              <td className="px-4 py-3 text-right" onClick={(e) => e.stopPropagation()}>
+                                <div className="inline-flex items-center justify-end gap-1">
+                                  {c.status !== 'active' ? (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateClientStatusMutation.mutate({ id: c.id, status: 'active' })
+                                      }
+                                      title="Activate client"
+                                      className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  ) : null}
+                                  <button
+                                    type="button"
+                                    onClick={() => openEditClientModal(c)}
+                                    title="Edit client"
+                                    className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                  >
+                                    <Pencil className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setDeleteTarget({ kind: 'client', item: c })}
+                                    title="Delete client"
+                                    className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+                              </td>
+                            ) : null}
                           </tr>
                         );
                       })}
@@ -1550,6 +1856,29 @@ export function ClientServicesPage() {
                             Generate Contract
                           </button>
                         ) : null}
+
+                        {canManagePipeline ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => openEditProposalModal(prop)}
+                              title="Edit proposal"
+                              className="inline-flex h-8 items-center gap-1 rounded border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-[#1E3252] dark:bg-[#091221] dark:text-slate-200"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setDeleteTarget({ kind: 'proposal', item: prop })}
+                              title="Delete proposal"
+                              className="inline-flex h-8 items-center gap-1 rounded border border-red-200 bg-white px-2.5 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-900/50 dark:bg-[#091221] dark:text-red-400 dark:hover:bg-red-950/30"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Delete
+                            </button>
+                          </>
+                        ) : null}
                       </div>
                     </div>
                   </section>
@@ -1642,15 +1971,52 @@ export function ClientServicesPage() {
                           )}
                         </td>
                         <td className="px-4 py-3 text-right">
-                          {client && canManageProjects ? (
-                            <button
-                              type="button"
-                              onClick={() => openClientProjectModal(client, ctr)}
-                              className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
-                            >
-                              Launch Project →
-                            </button>
-                          ) : null}
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            {client && canManageProjects ? (
+                              <button
+                                type="button"
+                                onClick={() => openClientProjectModal(client, ctr)}
+                                className="text-xs font-medium text-[#0B3B66] hover:underline dark:text-sky-400"
+                              >
+                                Launch Project →
+                              </button>
+                            ) : null}
+                            {canCommercialApprove ? (
+                              <>
+                                {ctr.status !== 'completed' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      updateContractStatusMutation.mutate({
+                                        id: ctr.id,
+                                        status: 'completed',
+                                      })
+                                    }
+                                    title="Mark contract completed"
+                                    className="rounded p-1 text-emerald-600 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                                  >
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() => openEditContractModal(ctr)}
+                                  title="Edit contract"
+                                  className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeleteTarget({ kind: 'contract', item: ctr })}
+                                  title="Delete contract"
+                                  className="rounded p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -1682,13 +2048,46 @@ export function ClientServicesPage() {
                   {selectedLead.contact_phone ? ` · ${selectedLead.contact_phone}` : ''}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedLeadId(null)}
-                className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
-              >
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                {canManagePipeline ? (
+                  <>
+                    {selectedLead.stage !== 'won' ? (
+                      <button
+                        type="button"
+                        onClick={() => updateLeadMutation.mutate({ id: selectedLead.id, stage: 'won' })}
+                        title="Mark lead won"
+                        className="inline-flex h-8 items-center gap-1 rounded border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-300"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        Mark Won
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => openEditLeadModal(selectedLead)}
+                      title="Edit lead"
+                      className="rounded p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-[#13233C] dark:hover:text-white"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteTarget({ kind: 'lead', item: selectedLead })}
+                      title="Delete lead"
+                      className="rounded p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:text-red-400"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => setSelectedLeadId(null)}
+                  className="rounded p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-[#13233C]"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
             </div>
 
             <div className="mt-4 grid grid-cols-1 gap-4 rounded-lg border border-slate-200 bg-slate-50/70 p-4 sm:grid-cols-2 dark:border-[#1E3252] dark:bg-[#091221]">
@@ -1899,13 +2298,22 @@ export function ClientServicesPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
-              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">New Lead</h2>
-              <button type="button" onClick={() => setLeadModalOpen(false)} className="rounded p-1 text-slate-400">
+              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                {editingLead ? 'Edit Lead' : 'New Lead'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setLeadModalOpen(false);
+                  setEditingLead(null);
+                }}
+                className="rounded p-1 text-slate-400"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <form
-              onSubmit={leadForm.handleSubmit((vals) => createLeadMutation.mutate(vals))}
+              onSubmit={leadForm.handleSubmit((vals) => saveLeadFormMutation.mutate(vals))}
               className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2"
             >
               <div>
@@ -1929,7 +2337,7 @@ export function ClientServicesPage() {
                 <input {...leadForm.register('source')} placeholder="Referral, Website, Outbound" className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Initial Stage</label>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Stage</label>
                 <select {...leadForm.register('stage')} className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]">
                   {LEAD_STAGES.map((s) => (
                     <option key={s.id} value={s.id}>{s.label}</option>
@@ -1948,15 +2356,22 @@ export function ClientServicesPage() {
                 <input type="datetime-local" {...leadForm.register('next_follow_up_at')} className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2 font-mono text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div className="sm:col-span-2">
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Initial Requirements</label>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300">Requirements</label>
                 <textarea rows={2} {...leadForm.register('requirements_summary')} className="mt-1 w-full rounded-md border border-slate-300 bg-white p-2 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
-                <button type="button" onClick={() => setLeadModalOpen(false)} className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLeadModalOpen(false);
+                    setEditingLead(null);
+                  }}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
                   Cancel
                 </button>
-                <button type="submit" disabled={createLeadMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
-                  {createLeadMutation.isPending ? 'Creating...' : 'Create Lead'}
+                <button type="submit" disabled={saveLeadFormMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
+                  {saveLeadFormMutation.isPending ? 'Saving...' : editingLead ? 'Save Changes' : 'Create Lead'}
                 </button>
               </div>
             </form>
@@ -1968,13 +2383,22 @@ export function ClientServicesPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
-              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">Add Client Account</h2>
-              <button type="button" onClick={() => setClientModalOpen(false)} className="rounded p-1 text-slate-400">
+              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                {editingClient ? 'Edit Client Account' : 'Add Client Account'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setClientModalOpen(false);
+                  setEditingClient(null);
+                }}
+                className="rounded p-1 text-slate-400"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <form
-              onSubmit={clientForm.handleSubmit((vals) => createClientMutation.mutate(vals))}
+              onSubmit={clientForm.handleSubmit((vals) => saveClientFormMutation.mutate(vals))}
               className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2"
             >
               <div className="sm:col-span-2">
@@ -2011,11 +2435,18 @@ export function ClientServicesPage() {
                 <input {...clientForm.register('billing_address')} className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
-                <button type="button" onClick={() => setClientModalOpen(false)} className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setClientModalOpen(false);
+                    setEditingClient(null);
+                  }}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
                   Cancel
                 </button>
-                <button type="submit" disabled={createClientMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
-                  Save Client
+                <button type="submit" disabled={saveClientFormMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
+                  {saveClientFormMutation.isPending ? 'Saving...' : 'Save Client'}
                 </button>
               </div>
             </form>
@@ -2027,13 +2458,22 @@ export function ClientServicesPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
-              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">Draft Client Proposal</h2>
-              <button type="button" onClick={() => setProposalModalOpen(false)} className="rounded p-1 text-slate-400">
+              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                {editingProposal ? 'Edit Client Proposal' : 'Draft Client Proposal'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setProposalModalOpen(false);
+                  setEditingProposal(null);
+                }}
+                className="rounded p-1 text-slate-400"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <form
-              onSubmit={proposalForm.handleSubmit((vals) => createProposalMutation.mutate(vals))}
+              onSubmit={proposalForm.handleSubmit((vals) => saveProposalFormMutation.mutate(vals))}
               className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2"
             >
               <div>
@@ -2082,11 +2522,18 @@ export function ClientServicesPage() {
                 <input type="date" {...proposalForm.register('valid_until')} className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
-                <button type="button" onClick={() => setProposalModalOpen(false)} className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProposalModalOpen(false);
+                    setEditingProposal(null);
+                  }}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
                   Cancel
                 </button>
-                <button type="submit" disabled={createProposalMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
-                  Save Draft Proposal
+                <button type="submit" disabled={saveProposalFormMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
+                  {saveProposalFormMutation.isPending ? 'Saving...' : editingProposal ? 'Save Proposal' : 'Save Draft Proposal'}
                 </button>
               </div>
             </form>
@@ -2098,13 +2545,22 @@ export function ClientServicesPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
           <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-200 bg-white p-6 shadow-xl dark:border-[#1E3252] dark:bg-[#0C1729]">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3 dark:border-[#1E3252]">
-              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">Create Client Contract</h2>
-              <button type="button" onClick={() => setContractModalOpen(false)} className="rounded p-1 text-slate-400">
+              <h2 className="font-display text-lg font-semibold text-slate-900 dark:text-white">
+                {editingContract ? 'Edit Client Contract' : 'Create Client Contract'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setContractModalOpen(false);
+                  setEditingContract(null);
+                }}
+                className="rounded p-1 text-slate-400"
+              >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <form
-              onSubmit={contractForm.handleSubmit((vals) => createContractMutation.mutate(vals))}
+              onSubmit={contractForm.handleSubmit((vals) => saveContractFormMutation.mutate(vals))}
               className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2"
             >
               <div>
@@ -2146,6 +2602,8 @@ export function ClientServicesPage() {
                   <option value="draft">Draft</option>
                   <option value="pending_approval">Pending Approval</option>
                   <option value="active">Active (Signed)</option>
+                  <option value="completed">Completed</option>
+                  <option value="terminated">Terminated</option>
                 </select>
               </div>
               <div>
@@ -2157,11 +2615,18 @@ export function ClientServicesPage() {
                 <input type="date" {...contractForm.register('end_date')} className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 font-mono text-xs dark:border-[#1E3252] dark:bg-[#060D1A]" />
               </div>
               <div className="flex justify-end gap-2 border-t border-slate-100 pt-4 sm:col-span-2 dark:border-[#1E3252]">
-                <button type="button" onClick={() => setContractModalOpen(false)} className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContractModalOpen(false);
+                    setEditingContract(null);
+                  }}
+                  className="h-9 rounded-md border border-slate-200 px-4 text-xs font-medium dark:border-[#1E3252]"
+                >
                   Cancel
                 </button>
-                <button type="submit" disabled={createContractMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
-                  Save Contract
+                <button type="submit" disabled={saveContractFormMutation.isPending} className="h-9 rounded-md bg-[#0B3B66] px-4 text-xs font-medium text-white dark:bg-sky-600">
+                  {saveContractFormMutation.isPending ? 'Saving...' : 'Save Contract'}
                 </button>
               </div>
             </form>
@@ -2227,6 +2692,44 @@ export function ClientServicesPage() {
           </div>
         </div>
       ) : null}
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteTarget)}
+        title={
+          deleteTarget?.kind === 'lead'
+            ? 'Delete Lead'
+            : deleteTarget?.kind === 'client'
+              ? 'Delete Client Account'
+              : deleteTarget?.kind === 'proposal'
+                ? 'Delete Proposal'
+                : 'Delete Contract'
+        }
+        description={
+          deleteTarget?.kind === 'lead'
+            ? `Permanently delete lead "${deleteTarget.item.organization_name}"?`
+            : deleteTarget?.kind === 'client'
+              ? `Permanently delete client "${deleteTarget.item.name}" along with its contacts and contracts?`
+              : deleteTarget?.kind === 'proposal'
+                ? `Permanently delete proposal "${deleteTarget.item.proposal_number} · ${deleteTarget.item.title}"?`
+                : deleteTarget?.kind === 'contract'
+                  ? `Permanently delete contract "${deleteTarget.item.contract_number} · ${deleteTarget.item.title}"?`
+                  : ''
+        }
+        isPending={
+          deleteLeadMutation.isPending ||
+          deleteClientMutation.isPending ||
+          deleteProposalMutation.isPending ||
+          deleteContractMutation.isPending
+        }
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => {
+          if (!deleteTarget) return;
+          if (deleteTarget.kind === 'lead') deleteLeadMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'client') deleteClientMutation.mutate(deleteTarget.item.id);
+          else if (deleteTarget.kind === 'proposal') deleteProposalMutation.mutate(deleteTarget.item.id);
+          else deleteContractMutation.mutate(deleteTarget.item.id);
+        }}
+      />
     </div>
   );
 }
