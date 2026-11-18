@@ -1,0 +1,6 @@
+{
+  "name": "Company OS",
+  "description": "Internal Enterprise Resource Planning & Company Operating System for multi-unit product, client services, finance, and governance operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
